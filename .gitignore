@@ -1,0 +1,45 @@
+# Personal
+.bash*
+.cache/
+.config/
+.dotnet/
+.lesshst
+.local/
+.npm/
+.profile
+.ssh/
+.vscode-server/
+.wget-hsts
+
+# Other projects
+OpenCOLLADA/
+running_video_analysis_app/
+bonsai_venv/
+
+# Third party libraries
+core/
+
+# Generated data
+storage/
+
+# Build artifacts
+**/build/
+**/node_modules/
+**/dist/
+*.o
+*.so
+*.a
+*.log
+ninja_verbose.log
+
+# OS
+**/.DS_Store
+Thumbs.db
+
+# Keep application source
+!ifc_http_server/
+!bim_ai_ui/
+
+# Root files not part of the application
+CMakeLists.txt
+CMakeLists_root.txt

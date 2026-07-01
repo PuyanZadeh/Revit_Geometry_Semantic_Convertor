@@ -1,0 +1,19 @@
+{
+  "plugins": [
+    { "name": "IfcConvert", "path": "/home/puyan_zadeh/ifc_http_server/build/libifc_convert_plugin.so" },
+    { "name": "IfcGeomServer", "path": "/home/puyan_zadeh/ifc_http_server/build/libifc_geom_plugin.so" },
+    { "name": "Visualization", "path": "/home/puyan_zadeh/ifc_http_server/build/libvisualization_plugin.so" },
+    { "name": "Logging", "path": "/home/puyan_zadeh/ifc_http_server/build/liblogging_plugin.so" },
+    { "name": "Security", "path": "/home/puyan_zadeh/ifc_http_server/build/libsecurity_plugin.so" },
+    { "name": "QualityControl", "path": "/home/puyan_zadeh/ifc_http_server/build/libqc_plugin.so" },
+    { "name": "Federation", "path": "/home/puyan_zadeh/ifc_http_server/build/libfederation_plugin.so" },
+    { "name": "AIQuery", "path": "/home/puyan_zadeh/ifc_http_server/build/libaiquery_plugin.so" },
+    { "name": "ModelEdit", "path": "/home/puyan_zadeh/ifc_http_server/build/libmodeledit_plugin.so" },
+    { "name": "ClashDetection", "path": "/home/puyan_zadeh/ifc_http_server/build/libclashdetection_plugin.so" },
+    { "name": "QCExpansion", "path": "/home/puyan_zadeh/ifc_http_server/build/libqcexpansion_plugin.so" },
+    { "name": "Simulation4D", "path": "/home/puyan_zadeh/ifc_http_server/build/libsimulation4d_plugin.so" },
+    { "name": "Simulation5D", "path": "/home/puyan_zadeh/ifc_http_server/build/libsimulation5d_plugin.so" },
+    { "name": "SiteAnalysis", "path": "/home/puyan_zadeh/ifc_http_server/build/libsiteanalysis_plugin.so" },
+    { "name": "SpaceProgramming", "path": "/home/puyan_zadeh/ifc_http_server/build/libspaceprogramming_plugin.so" }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "ast": {
+    "op": "string",
+    "type": "string",
+    "globalId": "string",
+    "filters": [
+      {
+        "field": "string",
+        "op": "eq|contains",
+        "value": "string"
+      }
+    ]
+  },
+  "result": {
+    "status": "ok|error",
+    "payload": {}
+  }
+}
