@@ -1,0 +1,58 @@
+.vp-page {
+  display: flex;
+  flex-direction: column;
+  height: 80vh;
+  min-height: 520px;
+  box-sizing: border-box;
+  gap: 12px;
+  padding: 20px 24px;
+}
+
+.vp-toolbar {
+  flex: none;
+}
+
+.vp-toolbar-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.vp-view-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.vp-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 8px;
+}
+
+.vp-viewer-col {
+  flex: 1;
+  min-width: 0;
+  max-width: 1100px;
+  display: flex;
+}
+
+.vp-canvas {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #333;
+  border-radius: 4px;
+  overflow: hidden;
+  background: #1e1e1e;
+  cursor: pointer;
+}
+
+.vp-inspector-col {
+  width: 380px;
+  flex: none;
+  height: 100%;
+  border: 1px solid #333;
+  border-radius: 4px;
+  overflow: hidden;
+}

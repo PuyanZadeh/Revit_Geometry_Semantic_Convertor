@@ -12,13 +12,10 @@
 #include <unistd.h>
 #include <filesystem>
 
-// ADDED (AI hook)
 #include <algorithm>
-// ADDED (AI hook)
 #include "aiquery_ai_stub.h"
 
 using json = nlohmann::json;
-
 namespace fs = std::filesystem;
 
 static fs::path exe_dir() { return fs::canonical("/proc/self/exe").parent_path(); }
@@ -28,10 +25,8 @@ static fs::path data_root() { return server_root().parent_path() / "storage"; }
 static const std::string JSON_DIR = (data_root() / "outputs" / "gltf").string() + "/";
 static const std::string kDbgPath = (server_root() / "logs" / "dbg.log").string();
 
-// static const std::string JSON_DIR = "/home/puyan_zadeh/storage/outputs/gltf/";
 static const std::string MAPPING_EXT = ".map.json";
 static const std::string SEMANTIC_EXT = ".json";
-// static const char *kDbgPath = "/home/puyan_zadeh/ifc_http_server/logs/dbg.log";
 
 extern "C"
 {
@@ -40,20 +35,14 @@ extern "C"
         FILE *f = fopen(kDbgPath.c_str(), overwrite ? "w" : "a");
         if (!f)
             return;
+
         if (val.empty())
             fprintf(f, "%s\n", msg);
         else
             fprintf(f, "%s %s\n", msg, val.c_str());
+
         fclose(f);
     }
-
-    // static void dbg(const char* msg, const std::string& val = "") {
-    //     FILE* f = fopen(kDbgPath, "a");
-    //     if (!f) return;
-    //     if (val.empty()) fprintf(f, "%s\n", msg);
-    //     else fprintf(f, "%s %s\n", msg, val.c_str());
-    //     fclose(f);
-    // }
 
     static bool load_json_mmap(const std::string &path, json &out)
     {
@@ -70,6 +59,7 @@ extern "C"
 
         void *data = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
         close(fd);
+
         if (data == MAP_FAILED)
             return false;
 
@@ -89,227 +79,131 @@ extern "C"
         return true;
     }
 
-    static inline std::string trim_copy(const std::string &s)
-    {
-        size_t b = 0, e = s.size();
-        while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n'))
-            ++b;
-        while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n'))
-            --e;
-        return s.substr(b, e - b);
-    }
-
-    // ADD THIS HELPER (same file, outside handle_ifc_aiquery)
-    static json parse_raw_attrs(const std::string &raw)
-    {
-        json out = json::object();
-
-        // very fast, zero-regex, positional split
-        // IFC raw_attrs format: comma-separated, quoted strings or tokens
-        std::vector<std::string> tokens;
-        tokens.reserve(16);
-
-        std::string cur;
-        bool in_str = false;
-
-        for (char c : raw)
-        {
-            if (c == '\'')
-            {
-                in_str = !in_str;
-                continue;
-            }
-            if (c == ',' && !in_str)
-            {
-                tokens.push_back(trim_copy(cur));
-                cur.clear();
-            }
-            else
-                cur.push_back(c);
-        }
-        if (!cur.empty())
-            tokens.push_back(trim_copy(cur));
-
-        // minimal, stable extraction
-        if (tokens.size() > 0)
-            out["GlobalId"] = tokens[0];
-        if (tokens.size() > 2)
-            out["Name"] = tokens[2];
-        if (tokens.size() > 4)
-            out["ObjectType"] = tokens[4];
-        if (tokens.size() > 5)
-            out["Relating"] = tokens[5];
-        if (tokens.size() > 6)
-            out["Related"] = tokens[6];
-
-        return out;
-    }
-
-    // static nlohmann::json resolve_step_ref(const nlohmann::json &sem_elements, const std::string &step_ref)
-
-    // {
-    //     json out = json::object();
-    //     if (step_ref.empty() || step_ref[0] != '#')
-    //         return out;
-
-    //     const std::string step = step_ref.substr(1);
-
-    //     for (auto &it : sem_elements.items())
-    //     {
-    //         const json &e = it.value();
-    //         if (e.contains("step_id") && e["step_id"].is_string() && e["step_id"] == step)
-    //         {
-    //             out = e;
-
-    //             // OPTIONAL parse on resolved target
-    //             if (e.contains("raw_attrs") && e["raw_attrs"].is_string())
-    //             {
-    //                 out["parsed"] = parse_raw_attrs(e["raw_attrs"].get<std::string>());
-    //             }
-    //             out["GlobalId"] = it.key();
-    //             break;
-    //         }
-    //     }
-    //     return out;
-    // }
-
-    // ADDED: stable helper (no behavior change unless used)
     static inline std::string model_name_from_map_path(const std::string &model_path)
     {
-        // model = ".../upload_xxx.map.json"  -> "upload_xxx"
-        return fs::path(model_path).stem().stem().string(); // strips ".map.json"
+        return fs::path(model_path).stem().stem().string();
     }
 
-
-static const json* find_element_by_gid(const json& sem, const std::string& gid)
-{
-    dbg("FIND_ELEM gid:", gid);
-
-    if (!sem.is_object())
+    static inline std::string resolve_map_path(const std::string &model)
     {
-        dbg("FIND_ELEM sem_not_object");
+        fs::path p(model);
+
+        if (p.is_absolute())
+            return p.string();
+
+        return JSON_DIR + model;
+    }
+
+    static inline std::string resolve_semantic_path_from_model(const std::string &model)
+    {
+        return JSON_DIR + model_name_from_map_path(model) + SEMANTIC_EXT;
+    }
+
+    static bool json_contains_node_index(const json &value, int64_t node_index)
+    {
+        if (value.is_number_integer())
+            return value.get<int64_t>() == node_index;
+
+        if (value.is_array())
+        {
+            for (const auto &v : value)
+            {
+                if (json_contains_node_index(v, node_index))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    static bool parse_int64(const std::string &s, int64_t &out)
+    {
+        try
+        {
+            size_t pos = 0;
+            long long v = std::stoll(s, &pos);
+            if (pos != s.size())
+                return false;
+
+            out = static_cast<int64_t>(v);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    static std::string resolve_unique_id_from_map(const json &map, const std::string &clicked_id, int64_t node_index = -1)
+    {
+        if (!map.is_object())
+            return "";
+
+        if (!clicked_id.empty() && map.contains(clicked_id))
+            return clicked_id;
+
+        int64_t parsed_node_index = -1;
+        bool has_parsed_node_index = parse_int64(clicked_id, parsed_node_index);
+
+        for (const auto &it : map.items())
+        {
+            const std::string &unique_id = it.key();
+            const json &nodes = it.value();
+
+            if (node_index >= 0 && json_contains_node_index(nodes, node_index))
+                return unique_id;
+
+            if (has_parsed_node_index && json_contains_node_index(nodes, parsed_node_index))
+                return unique_id;
+        }
+
+        return "";
+    }
+
+    static const json *find_semantic_by_unique_id(const json &sem, const std::string &uniqueId)
+    {
+        if (!sem.is_object())
+            return nullptr;
+
+        for (const auto &group : sem.items())
+        {
+            const json &bucket = group.value();
+
+            if (!bucket.is_object())
+                continue;
+
+            if (!bucket.contains("items") || !bucket["items"].is_array())
+                continue;
+
+            for (const auto &item : bucket["items"])
+            {
+                if (!item.is_object())
+                    continue;
+
+                if (item.value("uniqueId", "") == uniqueId)
+                    return &item;
+            }
+        }
+
         return nullptr;
     }
 
-    for (auto& group : sem.items())
+    static const json *find_next_semantic_context(const json &sem, const json &element)
     {
-        const std::string& group_name = group.key();
-        const json& bucket = group.value();
+        if (!element.is_object())
+            return nullptr;
 
-        if (!bucket.is_object())
-            continue;
+        if (element.contains("hostId") && element["hostId"].is_string())
+            return find_semantic_by_unique_id(sem, element["hostId"].get<std::string>());
 
-        if (!bucket.contains("items") || !bucket["items"].is_array())
-            continue;
-
-        const json& items = bucket["items"];
-
-        dbg("FIND_ELEM scanning_bucket:", group_name);
-        dbg("FIND_ELEM bucket_size:", std::to_string(items.size()));
-
-        for (const auto& item : items)
-        {
-            if (!item.is_object())
-                continue;
-
-            if (item.contains("uniqueId") && item["uniqueId"].is_string() && item["uniqueId"].get<std::string>() == gid)
-            {
-                dbg("FIND_ELEM found_in_bucket:", group_name);
-                dbg("FIND_ELEM match_field:", "uniqueId");
-                return &item;
-            }
-        }
+        return nullptr;
     }
-
-    dbg("FIND_ELEM not_found_anywhere");
-    return nullptr;
-}
-
-    // CONDITIONS (explained in-code):
-    // 1) If semantic JSON is IFC-style: sem["elements"] is an object keyed by GlobalId -> direct O(1) find().
-    // 2) If semantic JSON is your Revit-style grouped buckets: top-level keys like "doors","walls",... each maps to an array;
-    //    we scan arrays and match by uniqueId OR revitID OR GlobalId (first hit returns).
-    // static const json *find_element_by_gid(const json &sem, const std::string &gid)
-    // {
-    //     dbg("FIND_ELEM gid:", gid);
-
-    //     if (!sem.is_object())
-    //     {
-    //         dbg("FIND_ELEM sem_not_object");
-    //         return nullptr;
-    //     }
-
-    //     // Condition 1: IFC-style { "elements": { "<gid>": {...} } }
-    //     if (sem.contains("elements") && sem["elements"].is_object())
-    //     {
-    //         const json &elements = sem["elements"];
-    //         dbg("FIND_ELEM format:", "root.elements");
-    //         dbg("FIND_ELEM elements_size:", std::to_string(elements.size()));
-
-    //         auto it = elements.find(gid);
-    //         if (it != elements.end())
-    //         {
-    //             dbg("FIND_ELEM found_in:", "elements");
-    //             return &it.value();
-    //         }
-
-    //         dbg("FIND_ELEM not_found_in:", "elements");
-    //         return nullptr;
-    //     }
-
-    //     // Condition 2: Revit-style grouped buckets: { "doors":[...], "walls":[...], ... }
-    //     dbg("FIND_ELEM format:", "grouped_buckets");
-    //     dbg("FIND_ELEM root_keys_count:", std::to_string(sem.size()));
-
-    //     for (auto &group : sem.items())
-    //     {
-    //         const std::string &group_name = group.key();
-    //         const json &bucket = group.value();
-
-    //         if (!bucket.is_array())
-    //             continue;
-
-    //         dbg("FIND_ELEM scanning_bucket:", group_name);
-    //         dbg("FIND_ELEM bucket_size:", std::to_string(bucket.size()));
-
-    //         for (const auto &item : bucket)
-    //         {
-    //             if (!item.is_object())
-    //                 continue;
-
-    //             if (item.contains("uniqueId") && item["uniqueId"].is_string() && item["uniqueId"].get<std::string>() == gid)
-    //             {
-    //                 dbg("FIND_ELEM found_in_bucket:", group_name);
-    //                 dbg("FIND_ELEM match_field:", "uniqueId");
-    //                 return &item;
-    //             }
-
-    //             if (item.contains("revitID") && item["revitID"].is_string() && item["revitID"].get<std::string>() == gid)
-    //             {
-    //                 dbg("FIND_ELEM found_in_bucket:", group_name);
-    //                 dbg("FIND_ELEM match_field:", "revitID");
-    //                 return &item;
-    //             }
-
-    //             if (item.contains("GlobalId") && item["GlobalId"].is_string() && item["GlobalId"].get<std::string>() == gid)
-    //             {
-    //                 dbg("FIND_ELEM found_in_bucket:", group_name);
-    //                 dbg("FIND_ELEM match_field:", "GlobalId");
-    //                 return &item;
-    //             }
-    //         }
-    //     }
-
-    //     dbg("FIND_ELEM not_found_anywhere");
-    //     return nullptr;
-    // }
 
     const char *plugin_name()
     {
         return "AI Query Plugin";
     }
 
-    // forward decl so helpers can re-dispatch
     const char *handle_ifc_aiquery(const std::string &input_json);
 
     static bool handle_action_nl_query(const json &req, const std::string &model, std::string &response)
@@ -318,7 +212,6 @@ static const json* find_element_by_gid(const json& sem, const std::string& gid)
         if (action != "nl_query")
             return false;
 
-        /* ---------------- NL QUERY (added; existing actions unchanged) ---------------- */
         std::string nl = req.value("nl", "");
         if (nl.empty())
         {
@@ -326,11 +219,9 @@ static const json* find_element_by_gid(const json& sem, const std::string& gid)
             return true;
         }
 
-        // AI returns AST (placeholder for now)
         json ast = ai_nl_to_ast(nl);
         std::string op = ast.value("op", "");
 
-        // deterministic dispatch to existing handlers
         if (op == "count_by_type")
         {
             json fwd = {
@@ -348,6 +239,7 @@ static const json* find_element_by_gid(const json& sem, const std::string& gid)
                 {"action", "validate_id"},
                 {"globalId", ast.value("globalId", "")},
                 {"model", model}};
+
             response = handle_ifc_aiquery(fwd.dump());
             return true;
         }
@@ -358,6 +250,7 @@ static const json* find_element_by_gid(const json& sem, const std::string& gid)
                 {"action", "query_model"},
                 {"query", ast.value("globalId", "")},
                 {"model", model}};
+
             response = handle_ifc_aiquery(fwd.dump());
             return true;
         }
@@ -367,6 +260,7 @@ static const json* find_element_by_gid(const json& sem, const std::string& gid)
                          {"error", "unsupported op"},
                          {"ast", ast}})
                        .dump();
+
         return true;
     }
 
@@ -376,7 +270,6 @@ static const json* find_element_by_gid(const json& sem, const std::string& gid)
         if (action != "list_models")
             return false;
 
-        /* ---------------- list models ---------------- */
         std::ostringstream oss;
         oss << "ls " << JSON_DIR << "*" << MAPPING_EXT;
 
@@ -389,18 +282,21 @@ static const json* find_element_by_gid(const json& sem, const std::string& gid)
 
         json files = json::array();
         char buffer[512];
+
         while (fgets(buffer, sizeof(buffer), pipe))
         {
             std::string f(buffer);
             f.erase(f.find_last_not_of(" \n\r\t") + 1);
             files.push_back(f);
         }
+
         pclose(pipe);
 
         response = json({{"plugin", "AIQuery"},
                          {"status", "ok"},
                          {"models", files}})
                        .dump();
+
         return true;
     }
 
@@ -410,14 +306,10 @@ static const json* find_element_by_gid(const json& sem, const std::string& gid)
         if (action != "query_model")
             return false;
 
-        /* ---------------- GlobalId → node indices ---------------- */
-        std::string gid = req.value("query", "");
+        std::string query = req.value("query", "");
+        int64_t node_index = req.value("nodeIndex", -1);
 
-        // OLD
-        // std::string map_path = JSON_DIR + model + MAPPING_EXT;
-
-        // NEW: model is already full path to .map.json
-        std::string map_path = model;
+        std::string map_path = resolve_map_path(model);
 
         std::ifstream in(map_path);
         if (!in.good())
@@ -428,22 +320,27 @@ static const json* find_element_by_gid(const json& sem, const std::string& gid)
             return true;
         }
 
-        json mapping;
-        in >> mapping;
+        json map;
+        in >> map;
         in.close();
 
+        std::string unique_id = resolve_unique_id_from_map(map, query, node_index);
+
         json matches = json::array();
-        auto it = mapping.find(gid);
-        if (it != mapping.end())
+
+        if (!unique_id.empty() && map.contains(unique_id))
         {
-            matches.push_back({{"GlobalId", it.key()},
-                               {"node_indices", it.value()}});
+            matches.push_back({{"uniqueId", unique_id},
+                               {"node_indices", map[unique_id]}});
         }
 
         response = json({{"plugin", "AIQuery"},
                          {"status", "ok"},
+                         {"query", query},
+                         {"resolved_uniqueId", unique_id},
                          {"matches", matches}})
                        .dump();
+
         return true;
     }
 
@@ -453,35 +350,14 @@ static const json* find_element_by_gid(const json& sem, const std::string& gid)
         if (action != "count_by_type")
             return false;
 
-        /* ---------------- count by IFC type ---------------- */
         std::string type = req.value("type", "");
-
-        // OLD
-        // std::string sem_path = JSON_DIR + model + SEMANTIC_EXT;
-
-        // NEW: derive base model name from full path
-        // std::string model_name = fs::path(model).stem().string();
-        std::string model_name = model_name_from_map_path(model); // strips ".map.json"
-        std::string sem_path = JSON_DIR + model_name + SEMANTIC_EXT;
-
         if (type.empty())
         {
             response = R"({"error":"missing type"})";
             return true;
         }
 
-        // OBSOLETE (slower)
-        // std::ifstream in(sem_path);
-        // if (!in.good())
-        // {
-        //     response = json({{"error", "semantic json not found"},
-        //                      {"path", sem_path}})
-        //                    .dump();
-        //     return response.c_str();
-        // }
-        // json sem;
-        // in >> sem;
-        // in.close();
+        std::string sem_path = resolve_semantic_path_from_model(model);
 
         json sem;
         if (!load_json_mmap(sem_path, sem))
@@ -493,75 +369,371 @@ static const json* find_element_by_gid(const json& sem, const std::string& gid)
         }
 
         size_t count = 0;
-        const json &elements = sem["types"]["items"];
 
-        for (const auto &el : elements)
+        if (sem.is_object())
         {
-            if (!el.is_object())
-                continue;
-
-            if (el.value("type", "") != type)
-                continue;
-
-            bool pass = true;
-
-            if (req.contains("filters") && req["filters"].is_array())
+            for (const auto &group : sem.items())
             {
-                const json &params = (el.contains("parameters") && el["parameters"].is_object())
-                                         ? el["parameters"]
-                                         : json::object();
+                const json &bucket = group.value();
 
-                for (const auto &f : req["filters"])
+                if (!bucket.is_object())
+                    continue;
+
+                if (!bucket.contains("items") || !bucket["items"].is_array())
+                    continue;
+
+                for (const auto &el : bucket["items"])
                 {
-                    const std::string field = f.value("field", "");
-                    const std::string value = f.value("value", "");
+                    if (!el.is_object())
+                        continue;
 
-                    if (!params.contains(field) || !params[field].is_string() || params[field].get<std::string>() != value)
+                    bool type_match = false;
+
+                    if (el.value("type", "") == type)
+                        type_match = true;
+
+                    if (el.contains("parameters") && el["parameters"].is_object())
                     {
-                        pass = false;
-                        break;
+                        const json &params = el["parameters"];
+
+                        if (params.value("Type", "") == type)
+                            type_match = true;
+
+                        if (params.value("Type Name", "") == type)
+                            type_match = true;
                     }
-                }
-            }
 
-            if (pass)
-                count++;
-        }
-        /*
-                if (sem.contains("elements") && sem["elements"].is_object())        {
-                    for (auto &el : sem["elements"].items()){
-                        if (el.value().value("type", "") != type)
-                            continue;
+                    if (!type_match)
+                        continue;
 
-                        bool pass = true;
+                    bool pass = true;
 
-                        // APPLY FILTERS (optional)
-                        if (req.contains("filters") && req["filters"].is_array())
+                    if (req.contains("filters") && req["filters"].is_array())
+                    {
+                        for (const auto &f : req["filters"])
                         {
-                            for (auto &f : req["filters"])
-                            {
-                                const std::string field = f.value("field", "");
-                                const std::string value = f.value("value", "");
+                            const std::string field = f.value("field", "");
+                            const std::string value = f.value("value", "");
 
-                                if (!el.value().contains(field) ||
-                                    el.value()[field].get<std::string>() != value)
-                                {
-                                    pass = false;
-                                    break;
-                                }
+                            if (!el.contains("parameters") || !el["parameters"].is_object())
+                            {
+                                pass = false;
+                                break;
+                            }
+
+                            const json &params = el["parameters"];
+
+                            if (!params.contains(field) ||
+                                !params[field].is_string() ||
+                                params[field].get<std::string>() != value)
+                            {
+                                pass = false;
+                                break;
                             }
                         }
-
-                        if (pass)
-                            count++;
                     }
+
+                    if (pass)
+                        count++;
                 }
-        */
+            }
+        }
+
         response = json({{"plugin", "AIQuery"},
                          {"status", "ok"},
                          {"type", type},
                          {"count", count}})
                        .dump();
+
+        return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Generic semantic filtering engine (Semantic -> Semantic, Step 1)
+    //
+    // Everything below operates on plain JSON keys/values only. Nothing here
+    // may branch on a category name (Doors/Walls/Rooms/...) or a specific
+    // field name (Fire Rating/Width/...). New exporter fields and new
+    // top-level categories are supported automatically because lookup is by
+    // whatever key name the caller asks for, not by an enumerated list.
+    // ------------------------------------------------------------------
+
+    // Field resolution precedence (documented per spec requirement 3):
+    //   1. The field name as a direct top-level key on the semantic object
+    //      (category, uniqueId, typeId, parentId, hostId, levelId, intId,
+    //      refs, or any future top-level field the exporter adds).
+    //   2. If not found at the top level, the same key name inside the
+    //      object's "parameters" map (Revit parameters: "Fire Rating",
+    //      "Type", "Name", "Manufacturer", "Width", ...).
+    // Both steps are plain key lookups; no field name is ever special-cased.
+    static const json *resolve_field(const json &item, const std::string &field)
+    {
+        if (!item.is_object() || field.empty())
+            return nullptr;
+
+        auto top = item.find(field);
+        if (top != item.end())
+            return &(*top);
+
+        auto params_it = item.find("parameters");
+        if (params_it != item.end() && params_it->is_object())
+        {
+            auto p = params_it->find(field);
+            if (p != params_it->end())
+                return &(*p);
+        }
+
+        return nullptr;
+    }
+
+    // Generic stringification used by eq/neq/contains. Works uniformly for
+    // any JSON value type a field might hold, with no field-specific parsing.
+    static std::string json_to_compare_string(const json &v)
+    {
+        if (v.is_string())
+            return v.get<std::string>();
+
+        if (v.is_null())
+            return "";
+
+        if (v.is_boolean())
+            return v.get<bool>() ? "true" : "false";
+
+        if (v.is_number_integer())
+            return std::to_string(v.get<int64_t>());
+
+        if (v.is_number_unsigned())
+            return std::to_string(v.get<uint64_t>());
+
+        if (v.is_number_float())
+        {
+            std::ostringstream oss;
+            oss << v.get<double>();
+            return oss.str();
+        }
+
+        return v.dump();
+    }
+
+    // Generic leading-numeric-token parse, e.g. pulls 90 out of "90 minutes"
+    // or 4 out of "4' - 5 1/2\"". This is a plain text->number parse, NOT a
+    // unit converter: it never interprets units, feet/inches, or suffixes.
+    // Step 1 intentionally stops here; unit normalization (e.g. mm vs ft-in)
+    // is out of scope and left for a later step.
+    static bool extract_leading_number(const std::string &s, double &out)
+    {
+        size_t i = 0, n = s.size();
+
+        while (i < n && std::isspace(static_cast<unsigned char>(s[i])))
+            ++i;
+
+        size_t start = i;
+
+        if (i < n && (s[i] == '+' || s[i] == '-'))
+            ++i;
+
+        bool has_digits = false;
+
+        while (i < n && std::isdigit(static_cast<unsigned char>(s[i])))
+        {
+            ++i;
+            has_digits = true;
+        }
+
+        if (i < n && s[i] == '.')
+        {
+            ++i;
+            while (i < n && std::isdigit(static_cast<unsigned char>(s[i])))
+            {
+                ++i;
+                has_digits = true;
+            }
+        }
+
+        if (!has_digits)
+            return false;
+
+        try
+        {
+            out = std::stod(s.substr(start, i - start));
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    // Generic numeric coercion for gt/gte/lt/lte. Same rule for every field:
+    // native JSON numbers are used directly, strings are parsed via
+    // extract_leading_number (token parse only, no unit conversion).
+    static bool json_value_to_number(const json &v, double &out)
+    {
+        if (v.is_number())
+        {
+            out = v.get<double>();
+            return true;
+        }
+
+        if (v.is_boolean())
+        {
+            out = v.get<bool>() ? 1.0 : 0.0;
+            return true;
+        }
+
+        if (v.is_string())
+            return extract_leading_number(v.get<std::string>(), out);
+
+        return false;
+    }
+
+    // Evaluates a single {field, op, value} clause against one semantic
+    // object. Dispatches purely on the "op" string; contains no field-name
+    // or category-name branching.
+    static bool eval_filter_clause(const json &item, const json &clause)
+    {
+        if (!clause.is_object())
+            return false;
+
+        std::string field = clause.value("field", "");
+        std::string op = clause.value("op", "eq");
+
+        if (field.empty())
+            return false;
+
+        const json *actual = resolve_field(item, field);
+
+        if (op == "exists")
+            return actual != nullptr && !actual->is_null();
+
+        // Every other operator requires an actual, non-null value to compare
+        // against. A missing field never satisfies eq/neq/contains/gt/gte/lt/lte;
+        // callers that need to distinguish "absent" should use "exists".
+        if (!actual || actual->is_null())
+            return false;
+
+        json expected = clause.contains("value") ? clause.at("value") : json(nullptr);
+
+        if (op == "eq")
+            return json_to_compare_string(*actual) == json_to_compare_string(expected);
+
+        if (op == "neq")
+            return json_to_compare_string(*actual) != json_to_compare_string(expected);
+
+        if (op == "contains")
+        {
+            std::string needle = json_to_compare_string(expected);
+            if (needle.empty())
+                return false;
+
+            return json_to_compare_string(*actual).find(needle) != std::string::npos;
+        }
+
+        if (op == "gt" || op == "gte" || op == "lt" || op == "lte")
+        {
+            double a = 0.0, b = 0.0;
+
+            // Step 1 numeric comparison is a generic numeric-token parse only
+            // (see extract_leading_number); it does not do unit conversion.
+            if (!json_value_to_number(*actual, a) || !json_value_to_number(expected, b))
+                return false;
+
+            if (op == "gt")
+                return a > b;
+
+            if (op == "gte")
+                return a >= b;
+
+            if (op == "lt")
+                return a < b;
+
+            return a <= b;
+        }
+
+        // Unknown operator: never matches, rather than throwing.
+        return false;
+    }
+
+    // Combines all clauses for one semantic object using a generic AND/OR
+    // fold. "match" is "all" (AND, default) or "any" (OR); the fold itself
+    // has no knowledge of what each clause checks.
+    static bool eval_filters(const json &item, const json &filters, const std::string &match)
+    {
+        if (!filters.is_array() || filters.empty())
+            return true;
+
+        bool require_all = (match != "any");
+
+        for (const auto &clause : filters)
+        {
+            bool clause_result = eval_filter_clause(item, clause);
+
+            if (require_all && !clause_result)
+                return false;
+
+            if (!require_all && clause_result)
+                return true;
+        }
+
+        return require_all;
+    }
+
+    static bool handle_action_semantic_filter(const json &req, const std::string &model, std::string &response)
+    {
+        std::string action = req.value("action", "");
+        if (action != "semantic_filter")
+            return false;
+
+        std::string sem_path = resolve_semantic_path_from_model(model);
+
+        json sem;
+        if (!load_json_mmap(sem_path, sem))
+        {
+            response = json({{"error", "semantic json not found"},
+                             {"path", sem_path}})
+                           .dump();
+            return true;
+        }
+
+        json filters = (req.contains("filters") && req["filters"].is_array())
+                           ? req["filters"]
+                           : json::array();
+
+        std::string match = req.value("match", "all");
+
+        json results = json::array();
+
+        // Generic walk: every top-level bucket, every item inside its
+        // "items" array, regardless of bucket name or item category.
+        if (sem.is_object())
+        {
+            for (const auto &bucket_entry : sem.items())
+            {
+                const json &bucket = bucket_entry.value();
+
+                if (!bucket.is_object() || !bucket.contains("items") || !bucket["items"].is_array())
+                    continue;
+
+                for (const auto &item : bucket["items"])
+                {
+                    if (!item.is_object())
+                        continue;
+
+                    if (eval_filters(item, filters, match))
+                        results.push_back(item);
+                }
+            }
+        }
+
+        response = json({{"plugin", "AIQuery"},
+                         {"status", "ok"},
+                         {"action", "semantic_filter"},
+                         {"match", match},
+                         {"filters", filters},
+                         {"count", results.size()},
+                         {"results", results}})
+                       .dump();
+
         return true;
     }
 
@@ -571,25 +743,11 @@ static const json* find_element_by_gid(const json& sem, const std::string& gid)
         if (action != "search_elements")
             return false;
 
-        /* ---------------- search elements ---------------- */
-        /*
-        Request:
-        {
-          "action": "search_elements",
-          "model": "/full/path/to/model.map.json",
-          "type": "IFCWALL",          // optional
-          "name_contains": "Wall",    // optional
-          "limit": 50                // optional
-        }
-        */
-
         std::string type_filter = req.value("type", "");
         std::string name_filter = req.value("name_contains", "");
         size_t limit = req.value("limit", 100);
 
-        // derive semantic path from map.json
-        std::string model_name = fs::path(model).stem().stem().string(); // strips .map.json
-        std::string sem_path = JSON_DIR + model_name + SEMANTIC_EXT;
+        std::string sem_path = resolve_semantic_path_from_model(model);
 
         json sem;
         if (!load_json_mmap(sem_path, sem))
@@ -602,47 +760,110 @@ static const json* find_element_by_gid(const json& sem, const std::string& gid)
 
         json results = json::array();
 
-        // NOTE: this action is still IFC-oriented (expects sem["elements"]); kept as-is except for fallback.
-        // const json &elements = (sem.contains("elements") && sem["elements"].is_object()) ? sem["elements"] : sem;
-        const json &elements = sem["types"]["items"];
+        if (sem.is_object())
+        {
+            for (const auto &group : sem.items())
+            {
+                if (results.size() >= limit)
+                    break;
 
-for (const auto& elem : elements)
-{
-    if (results.size() >= limit)
-        break;
+                const std::string &group_name = group.key();
+                const json &bucket = group.value();
 
-    if (!elem.is_object())
-        continue;
+                if (!bucket.is_object())
+                    continue;
 
-    const std::string gid = elem.value("uniqueId", "");
+                if (!bucket.contains("items") || !bucket["items"].is_array())
+                    continue;
 
-    // type filter
-    if (!type_filter.empty())
-    {
-        if (elem.value("type", "") != type_filter)
-            continue;
-    }
+                for (const auto &elem : bucket["items"])
+                {
+                    if (results.size() >= limit)
+                        break;
 
-    // name filter via parameters.Type Name
-    if (!name_filter.empty())
-    {
-        if (!elem.contains("parameters") || !elem["parameters"].is_object())
-            continue;
+                    if (!elem.is_object())
+                        continue;
 
-        const json& params = elem["parameters"];
+                    if (!type_filter.empty())
+                    {
+                        bool type_match = false;
 
-        if (!params.contains("Type Name") || 
-            !params["Type Name"].is_string() ||
-            params["Type Name"].get<std::string>().find(name_filter) == std::string::npos)
-            continue;
-    }
+                        if (elem.value("type", "") == type_filter)
+                            type_match = true;
 
-    json entry;
-    entry["GlobalId"] = gid;
-    entry["type"] = elem.value("type", "");
+                        if (elem.contains("parameters") && elem["parameters"].is_object())
+                        {
+                            const json &params = elem["parameters"];
 
-    results.push_back(entry);
-}
+                            if (params.value("Type", "") == type_filter)
+                                type_match = true;
+
+                            if (params.value("Type Name", "") == type_filter)
+                                type_match = true;
+                        }
+
+                        if (!type_match)
+                            continue;
+                    }
+
+                    if (!name_filter.empty())
+                    {
+                        bool name_match = false;
+
+                        if (elem.contains("parameters") && elem["parameters"].is_object())
+                        {
+                            const json &params = elem["parameters"];
+
+                            if (params.contains("Name") &&
+                                params["Name"].is_string() &&
+                                params["Name"].get<std::string>().find(name_filter) != std::string::npos)
+                                name_match = true;
+
+                            if (params.contains("Type Name") &&
+                                params["Type Name"].is_string() &&
+                                params["Type Name"].get<std::string>().find(name_filter) != std::string::npos)
+                                name_match = true;
+
+                            if (params.contains("Family and Type") &&
+                                params["Family and Type"].is_string() &&
+                                params["Family and Type"].get<std::string>().find(name_filter) != std::string::npos)
+                                name_match = true;
+
+                            if (params.contains("Family") &&
+                                params["Family"].is_string() &&
+                                params["Family"].get<std::string>().find(name_filter) != std::string::npos)
+                                name_match = true;
+                        }
+
+                        if (!name_match)
+                            continue;
+                    }
+
+                    json entry;
+                    entry["bucket"] = group_name;
+                    entry["uniqueId"] = elem.value("uniqueId", "");
+                    entry["intId"] = elem.value("intId", 0);
+                    entry["typeId"] = elem.value("typeId", "");
+                    entry["hostId"] = elem.value("hostId", "");
+                    entry["levelId"] = elem.value("levelId", "");
+                    entry["category"] = elem.value("category", "");
+                    entry["family"] = elem.value("family", "");
+                    entry["type"] = elem.value("type", "");
+
+                    if (elem.contains("parameters") && elem["parameters"].is_object())
+                    {
+                        const json &params = elem["parameters"];
+                        entry["name"] = params.value("Name", "");
+                        entry["typeName"] = params.value("Type Name", "");
+                        entry["familyName"] = params.value("Family Name", "");
+                        entry["category"] = entry.value("category", params.value("Category", ""));
+                    }
+
+                    results.push_back(entry);
+                }
+            }
+        }
+
         response = json({{"plugin", "AIQuery"},
                          {"status", "ok"},
                          {"count", results.size()},
@@ -658,366 +879,187 @@ for (const auto& elem : elements)
         if (action != "get_element")
             return false;
 
-        /* ---------------- get element (semantic + properties + geometry) ---------------- */
-        std::string gid = req.value("globalId", "");
-        if (gid.empty())
+        std::string clicked_id = req.value("globalId", "");
+        int64_t node_index = req.value("nodeIndex", -1);
+
+        if (clicked_id.empty() && node_index < 0)
         {
-            response = R"({"error":"missing globalId"})";
+            response = R"({"error":"missing globalId or nodeIndex"})";
             return true;
         }
 
-        // CONDITIONS (explained in-code, no hardcoded paths):
-        // model is expected to be a file name like "X.map.json" (from UI), so we join JSON_DIR here.
-        // semantic file is expected to be "X.json" where X is model without ".map.json".
-        std::string map_path = JSON_DIR + model;
+        std::string map_path = resolve_map_path(model);
         std::string model_name = model_name_from_map_path(model);
-        std::string sem_path = JSON_DIR + model_name + SEMANTIC_EXT;
+        std::string sem_path = resolve_semantic_path_from_model(model);
 
         dbg("Starting", "Debugging", true);
         dbg("GET_ELEMENT map_path:", map_path);
         dbg("GET_ELEMENT model_name:", model_name);
         dbg("GET_ELEMENT sem_path:", sem_path);
+        dbg("GET_ELEMENT clicked_id:", clicked_id);
 
+        bool map_ok = false;
         bool semantic_ok = false;
         bool geometry_ok = false;
 
-        json element = json::object();
-        json properties = json::object();
         json nodes = json::array();
+        json selected_element = json::object();
+        json resolved_element = json::object();
+        json properties = json::object();
+        json traversal_path = json::array();
 
-        // semantic
-        json sem;
-        bool sem_loaded = load_json_mmap(sem_path, sem);
-        dbg("GET_ELEMENT sem_load:", sem_loaded ? "true" : "false");
+        std::string semantic_unique_id;
 
-        if (sem_loaded)
-        {
-            dbg("inside load_json_mmap()");
-            dbg("GET_ELEMENT elements_size:", sem.contains("elements") ? std::to_string(sem["elements"].size()) : "no_elements");
-            dbg("GET_ELEMENT has_gid:", (sem.contains("elements") && sem["elements"].is_object() && sem["elements"].contains(gid)) ? "true" : "false");
-
-            const json *found_elem = find_element_by_gid(sem, gid);
-
-            dbg("gid: ", gid);
-
-            if (found_elem)
-            {
-                dbg("element or it.value(): ", found_elem->dump());
-                semantic_ok = true;
-                element = *found_elem;
-
-                dbg("element or it.value(): ", element.dump());
-
-                if (element.contains("raw_attrs") && element["raw_attrs"].is_string())
-                {
-                    properties = parse_raw_attrs(element["raw_attrs"].get<std::string>());
-
-                    // resolve STEP refs (#xxxx) → actual elements
-                    // This only makes sense for IFC-style sem["elements"]; for bucketed Revit JSON there is no step_id index map.
-                    /*if (sem.contains("elements") && sem["elements"].is_object())
-                    {
-                        const json &elements = sem["elements"];
-
-                        if (properties.contains("Relating") && properties["Relating"].is_string())
-                            properties["Relating_resolved"] =
-                                resolve_step_ref(elements, properties["Relating"].get<std::string>());
-
-                        if (properties.contains("Related") && properties["Related"].is_string())
-                            properties["Related_resolved"] =
-                                resolve_step_ref(elements, properties["Related"].get<std::string>());
-                    }*/
-                   /*if (sem.contains("elements") && sem["elements"].is_object())
-{
-    const json &elements = sem["elements"];
-
-    if (properties.contains("Relating") && properties["Relating"].is_string())
-        properties["Relating_resolved"] =
-            resolve_step_ref(elements, properties["Relating"].get<std::string>());
-
-    if (properties.contains("Related") && properties["Related"].is_string())
-        properties["Related_resolved"] =
-            resolve_step_ref(elements, properties["Related"].get<std::string>());
-}*/
-                }
-            }
-            else
-            {
-                dbg("Never found gid");
-            }
-        }
-        else
-        {
-            dbg("did not get inside load_json_mmap()");
-        }
-
-        // geometry
+        json map;
         std::ifstream min(map_path);
+
         dbg("GET_ELEMENT map_open:", min.good() ? "true" : "false");
 
         if (min.good())
         {
-            json map;
             min >> map;
             min.close();
 
-            auto it = map.find(gid);
-            if (it != map.end())
+            map_ok = true;
+            semantic_unique_id = resolve_unique_id_from_map(map, clicked_id, node_index);
+
+            if (!semantic_unique_id.empty() && map.contains(semantic_unique_id))
             {
                 geometry_ok = true;
-                nodes = it.value();
+                nodes = map[semantic_unique_id];
+            }
+        }
+
+        dbg("GET_ELEMENT resolved_uniqueId:", semantic_unique_id);
+
+        json sem;
+        bool sem_loaded = load_json_mmap(sem_path, sem);
+
+        dbg("GET_ELEMENT sem_load:", sem_loaded ? "true" : "false");
+
+        if (sem_loaded && !semantic_unique_id.empty())
+        {
+            const json *found_elem = find_semantic_by_unique_id(sem, semantic_unique_id);
+
+            if (found_elem)
+            {
+                semantic_ok = true;
+                selected_element = *found_elem;
+                resolved_element = *found_elem;
+
+                traversal_path.push_back(resolved_element.value("uniqueId", ""));
+
+                for (int depth = 0; depth < 32; ++depth)
+                {
+                    const json *next = find_next_semantic_context(sem, resolved_element);
+                    if (!next)
+                        break;
+
+                    resolved_element = *next;
+                    traversal_path.push_back(resolved_element.value("uniqueId", ""));
+                }
+
+                if (resolved_element.contains("parameters") && resolved_element["parameters"].is_object())
+                    properties = resolved_element["parameters"];
+            }
+            else
+            {
+                dbg("GET_ELEMENT semantic_not_found:", semantic_unique_id);
             }
         }
 
         response = json({{"plugin", "AIQuery"},
                          {"status", "ok"},
-                         {"GlobalId", gid},
+                         {"clicked_id", clicked_id},
+                         {"nodeIndex", node_index},
+                         {"map", map_ok},
                          {"semantic", semantic_ok},
                          {"geometry", geometry_ok},
+                         {"semantic_uniqueId", semantic_unique_id},
                          {"node_indices", nodes},
-                         {"element", element},
-                         {"properties", properties}})
+                         {"selected_element", selected_element},
+                         {"resolved_element", resolved_element},
+                         {"element", resolved_element},
+                         {"properties", properties},
+                         {"traversal_path", traversal_path}})
                        .dump();
 
         return true;
     }
+
     static bool handle_action_validate_id(const json &req, const std::string &model, std::string &response)
     {
         std::string action = req.value("action", "");
         if (action != "validate_id")
             return false;
 
-        std::string gid = req.value("globalId", "");
-        if (gid.empty())
+        std::string clicked_id = req.value("globalId", "");
+        int64_t node_index = req.value("nodeIndex", -1);
+
+        if (clicked_id.empty() && node_index < 0)
         {
-            response = R"({"error":"missing globalId"})";
+            response = R"({"error":"missing globalId or nodeIndex"})";
             return true;
         }
 
-        json properties = json::object();
+        std::string map_path = resolve_map_path(model);
+        std::string sem_path = resolve_semantic_path_from_model(model);
 
-        std::string model_name = fs::path(model).stem().stem().string();
-        std::string sem_path = JSON_DIR + model_name + SEMANTIC_EXT;
-
-        dbg("Starting", "Debugging", true);
-
+        bool map_ok = false;
         bool semantic_ok = false;
-
-        json sem;
-        if (load_json_mmap(sem_path, sem))
-        {
-            if (sem.is_object())
-            {
-                for (auto &group : sem.items())
-                {
-                    if (group.key() == "types")
-                        continue;
-
-                    const json &bucket = group.value();
-                    if (!bucket.is_object())
-                        continue;
-
-                    if (!bucket.contains("items") || !bucket["items"].is_array())
-                        continue;
-
-                    const json &items = bucket["items"];
-
-                    for (const auto &item : items)
-                    {
-                        if (!item.is_object())
-                            continue;
-
-                        if (item.contains("uniqueId") && item["uniqueId"].is_string() && item["uniqueId"].get<std::string>() == gid)
-                        {
-                            semantic_ok = true;
-
-                            if (item.contains("parameters") && item["parameters"].is_object())
-                                properties = item["parameters"];
-                            else
-                                properties = json::object();
-
-                            break;
-                        }
-                    }
-
-                    if (semantic_ok)
-                        break;
-                }
-            }
-        }
-
-        std::string map_path = model;
-
-        std::ifstream min(map_path);
         bool geometry_ok = false;
+
+        json properties = json::object();
         json nodes = json::array();
+
+        std::string semantic_unique_id;
+
+        json map;
+        std::ifstream min(map_path);
 
         if (min.good())
         {
-            json map;
             min >> map;
             min.close();
 
-            auto it = map.find(gid);
-            if (it != map.end())
+            map_ok = true;
+            semantic_unique_id = resolve_unique_id_from_map(map, clicked_id, node_index);
+
+            if (!semantic_unique_id.empty() && map.contains(semantic_unique_id))
             {
                 geometry_ok = true;
-                nodes = it.value();
+                nodes = map[semantic_unique_id];
+            }
+        }
+
+        json sem;
+        if (load_json_mmap(sem_path, sem) && !semantic_unique_id.empty())
+        {
+            const json *found_elem = find_semantic_by_unique_id(sem, semantic_unique_id);
+
+            if (found_elem)
+            {
+                semantic_ok = true;
+
+                if (found_elem->contains("parameters") && (*found_elem)["parameters"].is_object())
+                    properties = (*found_elem)["parameters"];
             }
         }
 
         response = json({{"plugin", "AIQuery"},
                          {"status", "ok"},
-                         {"GlobalId", gid},
+                         {"clicked_id", clicked_id},
+                         {"nodeIndex", node_index},
+                         {"map", map_ok},
                          {"semantic", semantic_ok},
-                         {"properties", properties},
                          {"geometry", geometry_ok},
+                         {"semantic_uniqueId", semantic_unique_id},
+                         {"properties", properties},
                          {"node_indices", nodes}})
                        .dump();
 
         return true;
     }
-    // static bool handle_action_validate_id(const json &req, const std::string &model, std::string &response)
-    // {
-    //     std::string action = req.value("action", "");
-    //     if (action != "validate_id")
-    //         return false;
-
-    //     /* ---------------- validate GlobalId ---------------- */
-    //     std::string gid = req.value("globalId", "");
-    //     if (gid.empty())
-    //     {
-    //         response = R"({"error":"missing globalId"})";
-    //         return true;
-    //     }
-
-    //     json properties = json::object();
-
-    //     /* ---------- semantic lookup ---------- */
-
-    //     // OLD
-    //     // std::string model_name = fs::path(model).filename().string();
-    //     // model_name = model_name.substr(0, model_name.find(".glb"));
-
-    //     // NEW: robust + consistent with mapping logic
-
-    //     /* ---------- semantic lookup ---------- */
-
-    //     // NEW: robust + consistent with mapping logic
-    //     // std::string model_name = fs::path(model).stem().string();
-    //     std::string model_name = fs::path(model).stem().stem().string(); // strips ".map.json"
-
-    //     std::string sem_path = JSON_DIR + model_name + SEMANTIC_EXT;
-
-    //     dbg("Starting", "Debugging", true);
-    //     // dbg("SEM_PATH", sem_path, false);
-
-    //     bool semantic_ok = false;
-
-    //     // std::ifstream sin(sem_path);
-    //     // if (sin.good())
-    //     // {
-    //     //     json sem;
-    //     //     sin >> sem;
-    //     //     sin.close();
-    //     json sem;
-    //     if (load_json_mmap(sem_path, sem))
-    //     {
-
-    //         // dbg("SEM_ROOT_KEYS", std::to_string(sem.size()), false);
-
-    //         // REQUIRED: semantics live under sem["elements"]
-    //         // if (sem.contains("elements") && sem["elements"].is_object())    {
-    //         if (!sem.contains("elements") || !sem["elements"].is_object())
-    //         {
-    //             // dbg("SEM_ERROR", "missing elements object", false);
-    //             semantic_ok = false;
-    //         }
-    //         else
-    //         {
-    //             // auto &elements = sem["elements"];
-    //             // dbg("", std::to_string(elements.size()));
-    //             // dbg("SEM_ELEMENTS_COUNT", std::to_string(sem["elements"].size()), false);
-    //             auto it = sem["elements"].find(gid);
-    //             if (it != sem["elements"].end())
-    //             {
-    //                 semantic_ok = true;
-
-    //                 // std::string prop_path = JSON_DIR + model_name + ".props.json"; // or your actual property file
-    //                 // json properties = json::object();
-    //                 const json &elem = it.value();
-
-    //                 dbg("SEM_Prop_", "passed extracting the props", false);
-    //                 // properties are embedded in semantic JSON → raw_attrs
-    //                 if (elem.contains("raw_attrs") && elem["raw_attrs"].is_string())
-    //                 {
-    //                     dbg("SEM_Prop_", "inside the IF raw_attrs", false);
-
-    //                     properties = parse_raw_attrs(elem["raw_attrs"].get<std::string>());
-
-    //                     dbg("SEM_Prop_", "extracted the raw_attrs", false);
-
-    //                     // resolve STEP refs (#xxxx) → actual elements
-    //                     if (properties.contains("Relating") && properties["Relating"].is_string())
-    //                         properties["Relating_resolved"] =
-    //                             resolve_step_ref(sem["elements"], properties["Relating"].get<std::string>());
-
-    //                     if (properties.contains("Related") && properties["Related"].is_string())
-    //                         properties["Related_resolved"] =
-    //                             resolve_step_ref(sem["elements"], properties["Related"].get<std::string>());
-    //                 }
-    //             }
-
-    //             /* // Direct O(1) lookup by GlobalId
-    //             // if (elements.contains(gid))
-    //             // if (sem["elements"].contains(gid))
-    //             // {
-    //             //     semantic_ok = true;
-    //             //     // dbg("SEM_MATCH contain", gid, false);
-    //             // }
-    //             // else
-    //             // {
-    //             // dbg("SEM_NO_MATCH : contain faild", gid, false);
-    //             // } */
-    //         }
-    //     }
-
-    //     /* ---------- geometry lookup ---------- */
-
-    //     // OLD
-    //     // std::string map_path = JSON_DIR + model + MAPPING_EXT;
-
-    //     // NEW: model already full path
-    //     std::string map_path = model;
-
-    //     std::ifstream min(map_path);
-    //     bool geometry_ok = false;
-    //     json nodes = json::array();
-
-    //     if (min.good())
-    //     {
-    //         json map;
-    //         min >> map;
-    //         min.close();
-
-    //         auto it = map.find(gid);
-    //         if (it != map.end())
-    //         {
-    //             geometry_ok = true;
-    //             nodes = it.value();
-    //         }
-    //     }
-
-    //     response = json({{"plugin", "AIQuery"},
-    //                      {"status", "ok"},
-    //                      {"GlobalId", gid},
-    //                      {"semantic", semantic_ok},
-    //                      {"properties", properties},
-    //                      {"geometry", geometry_ok},
-    //                      {"node_indices", nodes}})
-    //                    .dump();
-
-    //     return true;
-    // }
 
     const char *handle_ifc_aiquery(const std::string &input_json)
     {
@@ -1039,6 +1081,9 @@ for (const auto& elem : elements)
                 return response.c_str();
 
             if (handle_action_count_by_type(req, model, response))
+                return response.c_str();
+
+            if (handle_action_semantic_filter(req, model, response))
                 return response.c_str();
 
             if (handle_action_search_elements(req, model, response))

@@ -10,7 +10,7 @@ import LoggingPanel from "./plugins/LoggingPanel";
 import SecurityPanel from "./plugins/SecurityPanel";
 import ConvertPanel from "./plugins/ConvertPanel";
 import ViewerPanel from "./plugins/ViewerPanel";
-import AIQueryPanel from "./plugins/AIQueryPanel";
+import SemanticFilterPanel from "./plugins/SemanticFilterPanel";
 
 const App: React.FC = () => {
   const [output, setOutput] = useState("");
@@ -25,7 +25,7 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className="p-6 font-sans">
+    <div className="p-6 font-sans" style={{ padding: "24px", boxSizing: "border-box" }}>
       <h1 className="text-2xl font-bold mb-4">AI-BIM Dashboard</h1>
       <Tabs.Root defaultValue="convert">
         <Tabs.List className="flex gap-2 border-b pb-2">
@@ -57,7 +57,7 @@ const App: React.FC = () => {
 <ConvertPanel/>
 
 <ViewerPanel/>
-<AIQueryPanel/>
+<SemanticFilterPanel/>
       
       <ScrollArea.Root className="h-60 w-full overflow-y-auto border p-3 rounded bg-gray-50">
         <pre>{output}</pre>

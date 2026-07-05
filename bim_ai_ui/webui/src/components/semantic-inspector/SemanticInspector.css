@@ -1,0 +1,211 @@
+.si-panel {
+  height: 100%;
+  overflow-y: auto;
+  background: #181818;
+  color: #ddd;
+  font-size: 13px;
+  box-sizing: border-box;
+  padding: 12px;
+}
+
+.si-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: #999;
+  font-size: 11px;
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #2a2a2a;
+}
+
+.si-section {
+  margin-bottom: 4px;
+}
+
+.si-section-title {
+  color: #888;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 8px;
+}
+
+.si-subtitle {
+  color: #888;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 10px 0 6px;
+}
+
+.si-divider {
+  height: 1px;
+  background: #2a2a2a;
+  margin: 14px 0;
+}
+
+.si-empty {
+  color: #777;
+  font-style: italic;
+  font-size: 12px;
+  padding: 4px 0;
+}
+
+.si-error {
+  color: #e08080;
+}
+
+/* Selection key/value grid */
+.si-kv-grid {
+  display: grid;
+  grid-template-columns: 84px 1fr;
+  row-gap: 6px;
+  column-gap: 8px;
+}
+
+.si-kv-label {
+  color: #888;
+}
+
+.si-kv-value {
+  color: #f0f0f0;
+  word-break: break-word;
+}
+
+/* Current semantic context line */
+.si-context-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.si-context-category {
+  font-weight: 600;
+  color: #f0f0f0;
+}
+
+.si-context-id {
+  color: #999;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+/* Traversal chain */
+.si-chain {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.si-chip {
+  background: #262626;
+  border: 1px solid #3a3a3a;
+  border-radius: 4px;
+  padding: 3px 8px;
+  color: #ddd;
+  font-size: 12px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.si-chain-arrow {
+  color: #666;
+  font-size: 12px;
+}
+
+/* Properties table */
+.si-filter-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: #111;
+  border: 1px solid #333;
+  color: #ddd;
+  padding: 6px 8px;
+  font-size: 12px;
+  border-radius: 4px;
+  margin-bottom: 8px;
+}
+
+.si-prop-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.si-prop-table thead th {
+  position: sticky;
+  top: 0;
+  background: #202020;
+  color: #888;
+  text-align: left;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 6px 8px;
+  border-bottom: 1px solid #333;
+}
+
+.si-prop-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid #232323;
+  vertical-align: top;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.si-prop-table tbody tr:nth-child(even) {
+  background: #1c1c1c;
+}
+
+.si-prop-key {
+  color: #aaa;
+  width: 45%;
+}
+
+.si-prop-value {
+  color: #f0f0f0;
+}
+
+/* Advanced (raw JSON) */
+.si-advanced {
+  color: #999;
+}
+
+.si-advanced > summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #888;
+  padding: 4px 0;
+}
+
+.si-advanced-body {
+  margin-top: 8px;
+}
+
+.si-advanced-block {
+  margin-bottom: 12px;
+}
+
+.si-json {
+  max-height: 240px;
+  overflow: auto;
+  background: #111;
+  color: #ddd;
+  padding: 10px;
+  margin: 0;
+  border-radius: 4px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

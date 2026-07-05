@@ -8,6 +8,8 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
 import { loadModel } from "../viewer/model.manager";
 import { pickRevitId_interaction } from "../viewer/interaction.manager";
 import { pickRevitId_info } from "../viewer/info.manager";
+import SemanticInspector from "../components/semantic-inspector/SemanticInspector";
+import "./ViewerPanel.css";
 
 export default function ViewerPanel() {
   const [files, setFiles] = useState<string[]>([]);
@@ -549,66 +551,35 @@ console.log("model path:", `http://192.168.0.150/storage/outputs/gltf/${encodeUR
   }
 
   return (
-    <div style={{ width: "100%", height: "100%", padding: "10px" }}>
-      <h3>Select GLB File</h3>
+    <div className="vp-page">
+      <div className="vp-toolbar">
+        <div className="vp-toolbar-row">
+          <select value={selected} onChange={handleSelect} style={{ padding: "6px" }}>
+            <option value="">-- choose file --</option>
+            {files.map((f) => (
+              <option key={f} value={f}>
+                {f}
+              </option>
+            ))}
+          </select>
 
-      <select
-        value={selected}
-        onChange={handleSelect}
-        style={{ padding: "6px", marginBottom: "10px" }}
-      >
-        <option value="">-- choose file --</option>
-        {files.map((f) => (
-          <option key={f} value={f}>
-            {f}
-          </option>
-        ))}
-      </select>
-
-      <div style={{ display: "flex", gap: "8px", alignItems: "center", marginTop: "10px" }}>
-        <button onClick={zoomAll}>Zoom All</button>
-        <button onClick={() => setView("top")}>Top</button>
-        <button onClick={() => setView("east")}>East</button>
-        <button onClick={() => setView("north")}>North</button>
-        {/* <span>{pickedId ? `Revit ID: ${pickedId}` : ""}</span> */}
-        {/* {aiqErr ? <div style={{ color: "salmon" }}>{aiqErr}</div> : null} */}
-
-<span>
-  {pickedId ? `Revit ID: ${pickedId}` : ""}
-  {aiq?.GlobalId ? `  GlobalId: ${aiq.GlobalId}` : ""}
-  {Array.isArray(aiq?.node_indices) ? `  node_indices: ${aiq.node_indices.length}` : ""}
-</span>
-
-
-
-        {aiq ? (
-          <pre
-            style={{
-              maxHeight: 240,
-              overflow: "auto",
-              background: "#111",
-              color: "#ddd",
-              padding: 10,
-              marginTop: 10,
-            }}
-          >
-            {JSON.stringify(aiq, null, 2)}
-          </pre>
-        ) : null}
+          <div className="vp-view-buttons">
+            <button onClick={zoomAll}>Zoom All</button>
+            <button onClick={() => setView("top")}>Top</button>
+            <button onClick={() => setView("east")}>East</button>
+            <button onClick={() => setView("north")}>North</button>
+          </div>
+        </div>
       </div>
 
-      <div
-        ref={containerRef}
-        onClick={pickRevitId}
-        style={{
-          width: "80%",
-          height: "600px",
-          maxHeight: "600px",
-          overflow: "hidden",
-          border: "1px solid #ccc",
-          marginTop: "10px",
-        }}
-      />
+      <div className="vp-body">
+        <div className="vp-viewer-col">
+          <div ref={containerRef} onClick={pickRevitId} className="vp-canvas" />
+        </div>
+        <div className="vp-inspector-col">
+          <SemanticInspector aiq={aiq} pickedId={pickedId} aiqErr={aiqErr} />
+        </div>
+      </div>
     </div>
   );
 }

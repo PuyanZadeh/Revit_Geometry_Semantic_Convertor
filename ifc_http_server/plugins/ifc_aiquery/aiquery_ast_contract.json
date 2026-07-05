@@ -6,13 +6,43 @@
     "filters": [
       {
         "field": "string",
-        "op": "eq|contains",
-        "value": "string"
+        "op": "eq|neq|contains|gt|gte|lt|lte|exists",
+        "value": "string|number"
       }
     ]
   },
   "result": {
     "status": "ok|error",
     "payload": {}
+  },
+
+  "semantic_filter": {
+    "_comment": "Generic Semantic -> Semantic filtering engine (Step 1). Operates only on semantic.json; no traversal, no NLP.",
+    "request": {
+      "action": "semantic_filter",
+      "model": "string",
+      "match": "all|any (default: all)",
+      "filters": [
+        {
+          "field": "string (any top-level semantic field, e.g. category/uniqueId/typeId/parentId/hostId/levelId, or any key inside parameters)",
+          "op": "eq|neq|contains|gt|gte|lt|lte|exists",
+          "value": "string|number (omit for exists)"
+        }
+      ]
+    },
+    "field_resolution_order": [
+      "1. top-level key on the semantic object",
+      "2. same key name inside the object's parameters map"
+    ],
+    "numeric_ops_note": "gt/gte/lt/lte parse a leading numeric token from the field value (e.g. 90 from \"90 minutes\"). This is a generic text->number parse only, NOT unit conversion (no ft-in <-> mm normalization).",
+    "response": {
+      "plugin": "AIQuery",
+      "status": "ok|error",
+      "action": "semantic_filter",
+      "match": "all|any",
+      "filters": [],
+      "count": 0,
+      "results": []
+    }
   }
 }
