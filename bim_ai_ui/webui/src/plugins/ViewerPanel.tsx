@@ -11,9 +11,15 @@ import { pickRevitId_info } from "../viewer/info.manager";
 import SemanticInspector from "../components/semantic-inspector/SemanticInspector";
 import "./ViewerPanel.css";
 
-export default function ViewerPanel() {
+export default function ViewerPanel({
+  selectedModel,
+  onSelectModel,
+}: {
+  selectedModel: string;
+  onSelectModel: (file: string) => void;
+}) {
   const [files, setFiles] = useState<string[]>([]);
-  const [selected, setSelected] = useState<string>("");
+  const selected = selectedModel;
 
   const containerRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
@@ -546,7 +552,7 @@ console.log("model path:", `http://192.168.0.150/storage/outputs/gltf/${encodeUR
 
   function handleSelect(e: React.ChangeEvent<HTMLSelectElement>) {
     const file = e.target.value;
-    setSelected(file);
+    onSelectModel(file);
     if (file) loadModel_wrapper(file);
   }
 

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import api from "../api";
 import { pickField } from "../components/semantic-inspector/fieldUtils";
 import "./SemanticFilterPanel.css";
@@ -15,25 +15,13 @@ function emptyRow(): FilterRow {
   return { field: "", op: "eq", value: "" };
 }
 
-export default function SemanticFilterPanel() {
-  const [files, setFiles] = useState<string[]>([]);
-  const [selected, setSelected] = useState<string>("");
+export default function SemanticFilterPanel({ selectedModel }: { selectedModel: string }) {
   const [rows, setRows] = useState<FilterRow[]>([emptyRow()]);
   const [match, setMatch] = useState<"all" | "any">("all");
   const [response, setResponse] = useState<any>(null);
   const [requestError, setRequestError] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
-
-  useEffect(() => {
-    async function loadList() {
-      const req = { action: "list_models" };
-      const res = await api.post("/aiquery", req);
-      const sorted = (res.data.models || []).sort();
-      setFiles(sorted);
-    }
-    loadList();
-  }, []);
 
   function updateRow(index: number, patch: Partial<FilterRow>) {
     setRows((prev) => prev.map((r, i) => (i === index ? { ...r, ...patch } : r)));
@@ -55,8 +43,8 @@ export default function SemanticFilterPanel() {
     setRequestError("");
     setResponse(null);
 
-    if (!selected) {
-      setRequestError("Please choose a model.");
+    if (!selectedModel) {
+      setRequestError("Please choose a model in the Viewer above.");
       return;
     }
 
@@ -66,7 +54,7 @@ export default function SemanticFilterPanel() {
 
     const req = {
       action: "semantic_filter",
-      model: selected,
+      model: selectedModel.replace(/\.glb$/i, ".map.json"),
       match,
       filters,
     };
@@ -92,18 +80,9 @@ export default function SemanticFilterPanel() {
 
       <div className="sfp-section">
         <label className="sfp-label">Model</label>
-        <select
-          value={selected}
-          onChange={(e) => setSelected(e.target.value)}
-          className="sfp-select"
-        >
-          <option value="">-- choose model --</option>
-          {files.map((f) => (
-            <option key={f} value={f}>
-              {f}
-            </option>
-          ))}
-        </select>
+        <div className="sfp-active-model">
+          {selectedModel || "-- choose a model in the Viewer above --"}
+        </div>
       </div>
 
       <div className="sfp-section">

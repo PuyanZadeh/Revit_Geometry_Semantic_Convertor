@@ -14,6 +14,7 @@ import SemanticFilterPanel from "./plugins/SemanticFilterPanel";
 
 const App: React.FC = () => {
   const [output, setOutput] = useState("");
+  const [selectedModel, setSelectedModel] = useState("");
 
   const runPlugin = async (fn: () => Promise<any>) => {
     try {
@@ -56,8 +57,8 @@ const App: React.FC = () => {
 <h2 className="text-lg mt-6 font-semibold">Response:</h2>
 <ConvertPanel/>
 
-<ViewerPanel/>
-<SemanticFilterPanel/>
+<ViewerPanel selectedModel={selectedModel} onSelectModel={setSelectedModel} />
+<SemanticFilterPanel selectedModel={selectedModel} />
       
       <ScrollArea.Root className="h-60 w-full overflow-y-auto border p-3 rounded bg-gray-50">
         <pre>{output}</pre>
