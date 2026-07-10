@@ -43,3 +43,6 @@ Thumbs.db
 # Root files not part of the application
 CMakeLists.txt
 CMakeLists_root.txt
+
+# Secrets
+ifc_http_server/.env

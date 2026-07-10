@@ -27,58 +27,28 @@
   color: #333;
 }
 
-.sfp-select,
-.sfp-input {
-  padding: 6px 8px;
+.sfp-query-input {
+  width: 100%;
+  padding: 8px 10px;
   border: 1px solid #ccc;
   border-radius: 4px;
   font-size: 13px;
+  font-family: inherit;
   box-sizing: border-box;
+  resize: vertical;
 }
 
-.sfp-filter-rows {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-bottom: 8px;
+.sfp-json-input {
+  font-family: monospace;
 }
 
-.sfp-filter-row {
+/* TEMP-DEBUG(json-query-mode): remove with the mode toggle in SemanticFilterPanel.tsx */
+.sfp-mode-toggle {
   display: flex;
   gap: 8px;
-  align-items: center;
 }
 
-.sfp-field {
-  flex: 2;
-  min-width: 0;
-}
-
-.sfp-op {
-  flex: 1;
-  min-width: 110px;
-}
-
-.sfp-value {
-  flex: 2;
-  min-width: 0;
-}
-
-.sfp-remove-btn {
-  flex: none;
-  border: 1px solid #ccc;
-  background: #fff;
-  border-radius: 4px;
-  cursor: pointer;
-  padding: 4px 8px;
-}
-
-.sfp-remove-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.sfp-add-btn {
+.sfp-mode-btn {
   border: 1px solid #ccc;
   background: #fff;
   border-radius: 4px;
@@ -87,16 +57,10 @@
   font-size: 12px;
 }
 
-.sfp-radio-group {
-  display: flex;
-  gap: 16px;
-}
-
-.sfp-radio {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
+.sfp-mode-btn-active {
+  background: #222;
+  color: #fff;
+  border-color: #222;
 }
 
 .sfp-run-btn {
@@ -175,4 +139,11 @@
   word-break: break-word;
   max-height: 320px;
   overflow: auto;
+}
+
+/* TEMP-DEBUG(nlp-validation): remove this rule once the NLP layer has been validated. */
+.sfp-debug-json {
+  background: #fff8e1;
+  border: 1px solid #f0d98c;
+  border-radius: 4px;
 }

@@ -9,4 +9,4 @@
     • Implementation can change (stub → real AI)
 */
 
-nlohmann::json ai_nl_to_ast(const std::string& nl);
+nlohmann::json ai_nl_to_ast(const std::string& nl, const std::string& model);

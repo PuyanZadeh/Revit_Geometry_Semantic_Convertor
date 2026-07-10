@@ -270,6 +270,12 @@ void handle_request(tcp::socket socket) {
         std::string handler_name = "handle_ifc_" + target;
         std::string so_path = std::string(kSoDir) + "/libifc_" + target + "_plugin.so";
 
+        // TODO(infra): a long-running server process eventually stops picking up
+        // rebuilt plugin .so's -- /proc/<pid>/maps shows a stale mapping to a
+        // deleted inode, implying a leaked dlopen handle somewhere on this path
+        // (possibly an exception between dlopen and dlclose below skipping the
+        // close). Restarting the process is the current workaround. Deferred
+        // until after Step 2-6 semantic-engine validation is stable.
         void* handle = dlopen(so_path.c_str(), RTLD_LAZY);
         if (!handle) {
             http::response<http::string_body> res{http::status::not_found, version};

@@ -1,8 +1,9 @@
 {
   "ast": {
-    "op": "string",
+    "op": "count_by_type|validate_id|query_model|semantic_filter|unknown",
     "type": "string",
     "globalId": "string",
+    "match": "all|any (default: all; only used when op=semantic_filter)",
     "filters": [
       {
         "field": "string",

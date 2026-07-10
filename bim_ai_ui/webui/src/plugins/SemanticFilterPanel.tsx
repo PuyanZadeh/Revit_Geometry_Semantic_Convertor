@@ -3,43 +3,31 @@ import api from "../api";
 import { pickField } from "../components/semantic-inspector/fieldUtils";
 import "./SemanticFilterPanel.css";
 
-const OPERATORS = ["eq", "neq", "contains", "gt", "gte", "lt", "lte", "exists"];
+// TEMP-DEBUG(json-query-mode): this UI toggle and the JSON editor branch below
+// exist only to validate the semantic filtering engine independently of NLP
+// translation. Remove them, and the "Natural Language" / "JSON Query" mode
+// state, once the semantic engine has been fully validated -- the NL query
+// path below should then be the only path again. The backend "structured_query"
+// action this mode calls is NOT temporary and should stay.
+type QueryMode = "nl" | "json";
 
-interface FilterRow {
-  field: string;
-  op: string;
-  value: string;
-}
-
-function emptyRow(): FilterRow {
-  return { field: "", op: "eq", value: "" };
-}
+// Hidden temporarily per request; flip to true to bring the debug view back.
+const SHOW_NLP_DEBUG = false;
 
 export default function SemanticFilterPanel({ selectedModel }: { selectedModel: string }) {
-  const [rows, setRows] = useState<FilterRow[]>([emptyRow()]);
-  const [match, setMatch] = useState<"all" | "any">("all");
+  const [mode, setMode] = useState<QueryMode>("nl");
+  const [query, setQuery] = useState("");
+  const [jsonText, setJsonText] = useState("");
   const [response, setResponse] = useState<any>(null);
   const [requestError, setRequestError] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
 
-  function updateRow(index: number, patch: Partial<FilterRow>) {
-    setRows((prev) => prev.map((r, i) => (i === index ? { ...r, ...patch } : r)));
-  }
-
-  function addRow() {
-    setRows((prev) => [...prev, emptyRow()]);
-  }
-
-  function removeRow(index: number) {
-    setRows((prev) => prev.filter((_, i) => i !== index));
-  }
-
   function toggleCard(index: number) {
     setExpanded((prev) => ({ ...prev, [index]: !prev[index] }));
   }
 
-  async function runFilter() {
+  async function runQuery() {
     setRequestError("");
     setResponse(null);
 
@@ -48,16 +36,29 @@ export default function SemanticFilterPanel({ selectedModel }: { selectedModel: 
       return;
     }
 
-    const filters = rows
-      .filter((r) => r.field.trim() !== "")
-      .map((r) => (r.op === "exists" ? { field: r.field, op: r.op } : { field: r.field, op: r.op, value: r.value }));
+    const model = selectedModel.replace(/\.glb$/i, ".map.json");
+    let req: any;
 
-    const req = {
-      action: "semantic_filter",
-      model: selectedModel.replace(/\.glb$/i, ".map.json"),
-      match,
-      filters,
-    };
+    if (mode === "json") {
+      if (!jsonText.trim()) {
+        setRequestError("Please enter a query JSON.");
+        return;
+      }
+      let ast: any;
+      try {
+        ast = JSON.parse(jsonText);
+      } catch (e) {
+        setRequestError("Invalid JSON.");
+        return;
+      }
+      req = { action: "structured_query", model, ast };
+    } else {
+      if (!query.trim()) {
+        setRequestError("Please enter a query.");
+        return;
+      }
+      req = { action: "nl_query", model, nl: query };
+    }
 
     setLoading(true);
     try {
@@ -76,7 +77,7 @@ export default function SemanticFilterPanel({ selectedModel }: { selectedModel: 
 
   return (
     <div className="sfp-page">
-      <h3>Step 1 — Semantic Filter</h3>
+      <h3>Semantic Query</h3>
 
       <div className="sfp-section">
         <label className="sfp-label">Model</label>
@@ -85,78 +86,54 @@ export default function SemanticFilterPanel({ selectedModel }: { selectedModel: 
         </div>
       </div>
 
+      {/* TEMP-DEBUG(json-query-mode): remove this toggle once the semantic
+          engine has been fully validated -- see note near QueryMode above. */}
       <div className="sfp-section">
-        <label className="sfp-label">Filters</label>
-        <div className="sfp-filter-rows">
-          {rows.map((row, i) => (
-            <div className="sfp-filter-row" key={i}>
-              <input
-                className="sfp-input sfp-field"
-                placeholder="field (e.g. category, hostId, Level)"
-                value={row.field}
-                onChange={(e) => updateRow(i, { field: e.target.value })}
-              />
-              <select
-                className="sfp-select sfp-op"
-                value={row.op}
-                onChange={(e) => updateRow(i, { op: e.target.value })}
-              >
-                {OPERATORS.map((op) => (
-                  <option key={op} value={op}>
-                    {op}
-                  </option>
-                ))}
-              </select>
-              <input
-                className="sfp-input sfp-value"
-                placeholder="value"
-                value={row.value}
-                disabled={row.op === "exists"}
-                onChange={(e) => updateRow(i, { value: e.target.value })}
-              />
-              <button
-                className="sfp-remove-btn"
-                onClick={() => removeRow(i)}
-                disabled={rows.length === 1}
-                title="Remove filter"
-              >
-                ✕
-              </button>
-            </div>
-          ))}
-        </div>
-        <button className="sfp-add-btn" onClick={addRow}>
-          + Add Filter
-        </button>
-      </div>
-
-      <div className="sfp-section">
-        <label className="sfp-label">Match mode</label>
-        <div className="sfp-radio-group">
-          <label className="sfp-radio">
-            <input
-              type="radio"
-              name="match-mode"
-              checked={match === "all"}
-              onChange={() => setMatch("all")}
-            />
-            AND
-          </label>
-          <label className="sfp-radio">
-            <input
-              type="radio"
-              name="match-mode"
-              checked={match === "any"}
-              onChange={() => setMatch("any")}
-            />
-            OR
-          </label>
+        <label className="sfp-label">Mode</label>
+        <div className="sfp-mode-toggle">
+          <button
+            className={mode === "nl" ? "sfp-mode-btn sfp-mode-btn-active" : "sfp-mode-btn"}
+            onClick={() => setMode("nl")}
+          >
+            Natural Language
+          </button>
+          <button
+            className={mode === "json" ? "sfp-mode-btn sfp-mode-btn-active" : "sfp-mode-btn"}
+            onClick={() => setMode("json")}
+          >
+            JSON Query (Temporary Debug Mode)
+          </button>
         </div>
       </div>
+      {/* END TEMP-DEBUG(json-query-mode) */}
+
+      {mode === "nl" ? (
+        <div className="sfp-section">
+          <label className="sfp-label">Query</label>
+          <textarea
+            className="sfp-query-input"
+            placeholder="e.g. Find all doors on Level 1"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            rows={3}
+          />
+        </div>
+      ) : (
+        <div className="sfp-section">
+          <label className="sfp-label">Query JSON (op / match / filters)</label>
+          <textarea
+            className="sfp-query-input sfp-json-input"
+            placeholder={'{\n  "op": "semantic_filter",\n  "match": "all",\n  "filters": [\n    { "field": "category", "op": "eq", "value": "Doors" }\n  ]\n}'}
+            value={jsonText}
+            onChange={(e) => setJsonText(e.target.value)}
+            rows={10}
+          />
+        </div>
+      )}
 
       <div className="sfp-section">
-        <button className="sfp-run-btn" onClick={runFilter} disabled={loading}>
-          {loading ? "Running..." : "Run"}
+        <button className="sfp-run-btn" onClick={runQuery} disabled={loading}>
+          {loading ? "Running..." : "Run Query"}
         </button>
       </div>
 
@@ -168,6 +145,19 @@ export default function SemanticFilterPanel({ selectedModel }: { selectedModel: 
           {response.path ? ` (path: ${response.path})` : ""}
         </div>
       )}
+
+      {/* TEMP-DEBUG(nlp-validation): remove this block, and the matching backend field
+          (debug_nlp_translation) in aiquery.cpp, once the NLP layer has been validated.
+          Currently hidden via SHOW_NLP_DEBUG -- flip that back to true to re-show it. */}
+      {SHOW_NLP_DEBUG && response && response.debug_nlp_translation && (
+        <div className="sfp-section">
+          <label className="sfp-label">NLP Translation (Temporary Debug View)</label>
+          <pre className="sfp-json sfp-debug-json">
+            {JSON.stringify(response.debug_nlp_translation, null, 2)}
+          </pre>
+        </div>
+      )}
+      {/* END TEMP-DEBUG(nlp-validation) */}
 
       {results && (
         <div className="sfp-section">
