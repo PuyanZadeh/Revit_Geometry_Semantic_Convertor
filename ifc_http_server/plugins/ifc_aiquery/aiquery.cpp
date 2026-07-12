@@ -258,24 +258,76 @@ extern "C"
     // relationship (as opposed to a real composition/ownership one like
     // hostId/parentId) belongs in this same set, not as a one-off check
     // scattered elsewhere.
+    //
+    // Note this set is about classification vs. semantic-context, a
+    // different axis from the hierarchical/associative distinction below --
+    // hostId/parentId are hierarchical (one object physically contains or
+    // owns another); refs.fromRoomId/refs.toRoomId are associative (a Door
+    // references two Rooms it connects; neither owns the other). Both kinds
+    // are equally valid traversal edges to this engine -- it stays
+    // field-name-agnostic either way -- this is a documentation distinction
+    // for callers, not a behavioral one.
     static const std::unordered_set<std::string> &classification_link_fields()
     {
         static const std::unordered_set<std::string> fields = {"typeId"};
         return fields;
     }
 
+    // Resolves a relationship field's value on `item`: a bare name is a
+    // direct top-level lookup (unchanged from before dotted-path support
+    // existed); a dotted path ("refs.fromRoomId") walks nested objects.
+    // This mirrors resolve_path's dotted-walk (used by select/group_by/
+    // sort), duplicated locally rather than calling it directly, since
+    // resolve_path is defined much later in this file and reordering large
+    // sections isn't worth the risk for a small walk like this.
+    static const json *resolve_relationship_value(const json &item, const std::string &field)
+    {
+        if (!item.is_object())
+            return nullptr;
+
+        if (field.find('.') == std::string::npos)
+        {
+            auto it = item.find(field);
+            return it != item.end() ? &(*it) : nullptr;
+        }
+
+        const json *cur = &item;
+        size_t start = 0;
+
+        while (true)
+        {
+            size_t dot = field.find('.', start);
+            std::string segment = field.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
+
+            if (!cur->is_object())
+                return nullptr;
+
+            auto it = cur->find(segment);
+            if (it == cur->end())
+                return nullptr;
+
+            cur = &(*it);
+
+            if (dot == std::string::npos)
+                return cur;
+
+            start = dot + 1;
+        }
+    }
+
     // A relationship name is only valid if it's actually a field the
     // exporter produces -- determined from the loaded model's own data, not
     // a hardcoded list, so a genuinely new exporter field works
     // automatically while a typo ("hotsId") is never mistaken for a real
-    // relationship (it will never appear as a key on any object).
+    // relationship (it will never appear as a key, or nested path, on any
+    // object).
     static bool relationship_exists_in_schema(const json &sem, const std::string &field)
     {
         bool found = false;
 
         for_each_semantic_item(sem, [&](const json &item)
                                 {
-            if (!found && item.contains(field))
+            if (!found && resolve_relationship_value(item, field) != nullptr)
                 found = true; });
 
         return found;
@@ -287,14 +339,11 @@ extern "C"
     // relationship to ask for; this function just follows it.
     static const json *traverse_relationship(const json &sem, const json &item, const std::string &relationship)
     {
-        if (!item.is_object())
+        const json *value = resolve_relationship_value(item, relationship);
+        if (!value || !value->is_string())
             return nullptr;
 
-        auto it = item.find(relationship);
-        if (it == item.end() || !it->is_string())
-            return nullptr;
-
-        return find_semantic_by_unique_id(sem, it->get<std::string>());
+        return find_semantic_by_unique_id(sem, value->get<std::string>());
     }
 
     // Applies one traversal hop across a whole result set: each item's
@@ -339,8 +388,8 @@ extern "C"
 
         for_each_semantic_item(sem, [&](const json &candidate)
                                 {
-            auto it = candidate.find(relationship);
-            if (it != candidate.end() && it->is_string() && it->get<std::string>() == target_id)
+            const json *value = resolve_relationship_value(candidate, relationship);
+            if (value && value->is_string() && value->get<std::string>() == target_id)
                 out.push_back(candidate); });
 
         return out;
@@ -415,6 +464,28 @@ extern "C"
         return out;
     }
 
+    // Validates every step in a flat chain against the same rules used
+    // everywhere traversal is requested (classification links rejected,
+    // unknown relationships rejected). Extracted from what was previously
+    // an inline loop in handle_action_semantic_filter's "traverse" handling
+    // so aggregate's graph-based group_by (Step 6) can reuse the identical
+    // checks instead of re-deriving them; behavior for "traverse" itself is
+    // unchanged, just relocated. Returns the first error found, or an empty
+    // string if the whole chain is valid.
+    static std::string validate_traversal_steps(const json &sem, const std::vector<TraversalStep> &chain)
+    {
+        for (const auto &step : chain)
+        {
+            if (classification_link_fields().count(step.field))
+                return "\"" + step.field + "\" is a classification link, not a traversal relationship";
+
+            if (!relationship_exists_in_schema(sem, step.field))
+                return "Unknown traversal relationship: \"" + step.field + "\"";
+        }
+
+        return "";
+    }
+
     // Applies an ordered chain of traversal hops (forward or reverse per
     // step), feeding each hop's output into the next. A one-entry chain is
     // a single hop; nothing about this function changes for longer chains
@@ -430,6 +501,385 @@ extern "C"
                           : traverse_results(sem, current, step.field);
 
         return current;
+    }
+
+    // ------------------------------------------------------------------
+    // Step 4: relationship path preservation.
+    //
+    // Deliberately NOT built by modifying traverse_results/traverse_results_
+    // reverse/apply_traversal_chain above -- those stay exactly as validated
+    // in Steps 2-3. This is a separate, parallel orchestration that reuses
+    // the same per-item resolution primitives (traverse_relationship /
+    // traverse_relationship_reverse) but additionally records, per hop,
+    // which source object reached which target object. Edges store only
+    // uniqueId references -- the actual objects still live exactly once, in
+    // the (unchanged) results array, never copied into the path data.
+    // ------------------------------------------------------------------
+
+    // One hop, with edge recording. Same dedup rule as traverse_results/
+    // traverse_results_reverse (each distinct target appears once in the
+    // returned set), but every (from, to) pair actually followed is
+    // appended to `edges_out` regardless of whether its target was already
+    // seen -- two different origins reaching the same target are two
+    // distinct edges against one shared result object.
+    static json traverse_results_with_edges(const json &sem, const json &items, const TraversalStep &step, json &edges_out)
+    {
+        std::unordered_set<std::string> seen;
+        json out = json::array();
+
+        for (const auto &item : items)
+        {
+            std::string from_id = item.value("uniqueId", "");
+
+            if (step.reverse)
+            {
+                json matches = traverse_relationship_reverse(sem, item, step.field);
+
+                for (const auto &match : matches)
+                {
+                    std::string to_id = match.value("uniqueId", "");
+                    edges_out.push_back({{"from", from_id}, {"to", to_id}});
+
+                    if (!to_id.empty() && !seen.insert(to_id).second)
+                        continue;
+
+                    out.push_back(match);
+                }
+            }
+            else
+            {
+                const json *related = traverse_relationship(sem, item, step.field);
+                if (!related)
+                    continue;
+
+                std::string to_id = related->value("uniqueId", "");
+                edges_out.push_back({{"from", from_id}, {"to", to_id}});
+
+                if (!to_id.empty() && !seen.insert(to_id).second)
+                    continue;
+
+                out.push_back(*related);
+            }
+        }
+
+        return out;
+    }
+
+    // Applies the traversal chain like apply_traversal_chain, but also
+    // builds `paths_out`: one entry per hop, in chain order, each holding
+    // that hop's relationship/direction plus the edges it followed. A
+    // longer chain just means more entries here -- nothing about this
+    // function's shape changes for additional hops.
+    static json apply_traversal_chain_with_paths(const json &sem, const json &items, const std::vector<TraversalStep> &chain, json &paths_out)
+    {
+        json current = items;
+
+        for (const auto &step : chain)
+        {
+            json edges = json::array();
+            current = traverse_results_with_edges(sem, current, step, edges);
+
+            paths_out.push_back({{"relationship", step.field},
+                                  {"direction", step.reverse ? "reverse" : "forward"},
+                                  {"edges", edges}});
+        }
+
+        return current;
+    }
+
+    // ------------------------------------------------------------------
+    // Step 5: branching traversal.
+    //
+    // Deliberately a separate request key ("traverse_tree") and a separate
+    // set of functions from everything above -- traverse_results/
+    // traverse_results_reverse/apply_traversal_chain(_with_paths) and the
+    // "traverse" request key are untouched, so every existing linear query
+    // behaves exactly as before. A linear chain is the one-child special
+    // case of this tree grammar; branching is what happens when a node has
+    // more than one child. Reuses traverse_relationship/
+    // traverse_relationship_reverse -- the same per-item resolution the
+    // linear engine uses -- so there is still exactly one implementation of
+    // "how a single hop is resolved."
+    // ------------------------------------------------------------------
+
+    // One node in a traversal tree: a hop (field/direction) plus what
+    // happens after it. `then` empty -> leaf, this hop's output joins the
+    // final union. `then` with one entry -> continue linearly. `then` with
+    // more than one entry -> branch, each applied independently to this
+    // hop's output.
+    struct TraversalNode
+    {
+        std::string field;
+        bool reverse;
+        std::vector<TraversalNode> then;
+    };
+
+    static TraversalNode parse_traversal_node(const json &v)
+    {
+        TraversalNode node;
+        node.field = v.value("field", "");
+        node.reverse = v.value("direction", "forward") == "reverse";
+
+        if (v.contains("then"))
+        {
+            const json &then = v["then"];
+
+            if (then.is_array())
+                for (const auto &child : then)
+                    node.then.push_back(parse_traversal_node(child));
+            else if (then.is_object())
+                node.then.push_back(parse_traversal_node(then));
+        }
+
+        return node;
+    }
+
+    // A "forest" is the list of root nodes -- traverse_tree's top-level
+    // value follows the same single-object-or-array grammar as `then`, so
+    // root-level branching and nested branching share one shape.
+    static std::vector<TraversalNode> parse_traversal_forest(const json &v)
+    {
+        std::vector<TraversalNode> roots;
+
+        if (v.is_array())
+            for (const auto &node : v)
+                roots.push_back(parse_traversal_node(node));
+        else if (v.is_object())
+            roots.push_back(parse_traversal_node(v));
+
+        return roots;
+    }
+
+    // Validates every field anywhere in the tree against the same rules
+    // "traverse" already enforces (classification links rejected, unknown
+    // relationships rejected) -- reuses classification_link_fields() and
+    // relationship_exists_in_schema() rather than re-deriving the checks.
+    // Returns the first error found, or an empty string if the whole tree
+    // is valid.
+    static std::string validate_traversal_forest(const json &sem, const std::vector<TraversalNode> &nodes)
+    {
+        for (const auto &node : nodes)
+        {
+            if (classification_link_fields().count(node.field))
+                return "\"" + node.field + "\" is a classification link, not a traversal relationship";
+
+            if (!relationship_exists_in_schema(sem, node.field))
+                return "Unknown traversal relationship: \"" + node.field + "\"";
+
+            std::string child_error = validate_traversal_forest(sem, node.then);
+            if (!child_error.empty())
+                return child_error;
+        }
+
+        return "";
+    }
+
+    // Recursively applies one node to `items`: records this hop's edges
+    // (regardless of depth), then either contributes its deduplicated
+    // output to the overall union (leaf) or recurses into each child
+    // (branch), passing this hop's output as their input. `path_node_out`
+    // mirrors the tree shape so branches remain distinguishable in the
+    // response -- edges plus a nested "then" for whatever this node
+    // branched into, omitted for a leaf.
+    static void apply_traversal_node(const json &sem, const json &items, const TraversalNode &node,
+                                      json &union_out, std::unordered_set<std::string> &union_seen,
+                                      json &path_node_out)
+    {
+        json edges = json::array();
+        json hop_out = json::array();
+        std::unordered_set<std::string> hop_seen;
+
+        for (const auto &item : items)
+        {
+            std::string from_id = item.value("uniqueId", "");
+
+            if (node.reverse)
+            {
+                json matches = traverse_relationship_reverse(sem, item, node.field);
+
+                for (const auto &match : matches)
+                {
+                    std::string to_id = match.value("uniqueId", "");
+                    edges.push_back({{"from", from_id}, {"to", to_id}});
+
+                    if (to_id.empty() || hop_seen.insert(to_id).second)
+                        hop_out.push_back(match);
+                }
+            }
+            else
+            {
+                const json *related = traverse_relationship(sem, item, node.field);
+                if (!related)
+                    continue;
+
+                std::string to_id = related->value("uniqueId", "");
+                edges.push_back({{"from", from_id}, {"to", to_id}});
+
+                if (to_id.empty() || hop_seen.insert(to_id).second)
+                    hop_out.push_back(*related);
+            }
+        }
+
+        path_node_out["relationship"] = node.field;
+        path_node_out["direction"] = node.reverse ? "reverse" : "forward";
+        path_node_out["edges"] = edges;
+
+        if (node.then.empty())
+        {
+            for (const auto &obj : hop_out)
+            {
+                std::string id = obj.value("uniqueId", "");
+                if (id.empty() || union_seen.insert(id).second)
+                    union_out.push_back(obj);
+            }
+
+            return;
+        }
+
+        json children = json::array();
+
+        for (const auto &child : node.then)
+        {
+            json child_path = json::object();
+            apply_traversal_node(sem, hop_out, child, union_out, union_seen, child_path);
+            children.push_back(child_path);
+        }
+
+        path_node_out["then"] = children;
+    }
+
+    // Applies a forest of root nodes (each independent, from the same
+    // starting items) and returns the union of every leaf across the whole
+    // tree, plus the tree-shaped path description in `paths_out`.
+    static json apply_traversal_forest(const json &sem, const json &items, const std::vector<TraversalNode> &roots, json &paths_out)
+    {
+        json union_out = json::array();
+        std::unordered_set<std::string> union_seen;
+
+        for (const auto &root : roots)
+        {
+            json root_path = json::object();
+            apply_traversal_node(sem, items, root, union_out, union_seen, root_path);
+            paths_out.push_back(root_path);
+        }
+
+        return union_out;
+    }
+
+    // ------------------------------------------------------------------
+    // Step 11: recursive traversal.
+    //
+    // Repeatedly follows ONE relationship (forward or reverse) starting
+    // from `items`, level by level, until max_depth is reached, a level
+    // finds no new objects, or the hard safety cap below is hit regardless
+    // of max_depth. Reuses traverse_relationship/traverse_relationship_
+    // reverse -- the exact same per-item resolvers "traverse" already
+    // uses -- for every hop; nothing about how a single hop resolves is
+    // reimplemented here. Does not modify the filtering, aggregation,
+    // constraint-evaluation, or set-operation engines.
+    // ------------------------------------------------------------------
+
+    // Absolute ceiling on recursion depth, applied even when the caller
+    // omits max_depth (or supplies one larger than this). The visited set
+    // already makes cycles converge naturally (a level that only reaches
+    // already-seen objects finds nothing new and stops); this is purely a
+    // safety net bounding worst-case work regardless.
+    static const int64_t RECURSIVE_TRAVERSAL_HARD_CAP = 1000;
+
+    // Result is every newly reached object across every depth level (not
+    // just the final frontier) -- a depth-1 discovery is included in the
+    // output even if the recursion continues on to depth 2, 3, etc. The
+    // starting objects themselves are never included, only what's newly
+    // reached from them, matching how "traverse"/"traverse_tree" already
+    // never include the starting objects either.
+    static json apply_recursive_traversal(const json &sem, const json &items, const std::string &field, bool reverse, int64_t max_depth, json &paths_out)
+    {
+        // max_depth < 0 means "omitted" (see call site) -- an explicit 0
+        // means zero hops, so the loop below runs zero times.
+        int64_t effective_max_depth = (max_depth >= 0 && max_depth < RECURSIVE_TRAVERSAL_HARD_CAP)
+                                           ? max_depth
+                                           : RECURSIVE_TRAVERSAL_HARD_CAP;
+
+        // "visited" tracks objects discovered during THIS walk (depth >= 1),
+        // not the starting items -- seeding it with the starting set would
+        // wrongly block legitimate discovery whenever a target happens to
+        // also belong to the starting set (e.g. one Furniture item's parent
+        // is itself categorized as Furniture). The starting objects are
+        // instead excluded from the output afterward, by identity.
+        std::unordered_set<std::string> visited;
+        std::unordered_set<std::string> starting_ids;
+        for (const auto &item : items)
+        {
+            std::string id = item.value("uniqueId", "");
+            if (!id.empty())
+                starting_ids.insert(id);
+        }
+
+        json result = json::array();
+        json frontier = items;
+
+        for (int64_t depth = 1; depth <= effective_max_depth; ++depth)
+        {
+            json edges = json::array();
+            json next_frontier = json::array();
+
+            for (const auto &item : frontier)
+            {
+                std::string from_id = item.value("uniqueId", "");
+
+                if (reverse)
+                {
+                    json matches = traverse_relationship_reverse(sem, item, field);
+
+                    for (const auto &match : matches)
+                    {
+                        std::string to_id = match.value("uniqueId", "");
+                        edges.push_back({{"from", from_id}, {"to", to_id}});
+
+                        if (!to_id.empty() && visited.insert(to_id).second)
+                            next_frontier.push_back(match);
+                    }
+                }
+                else
+                {
+                    const json *related = traverse_relationship(sem, item, field);
+                    if (!related)
+                        continue;
+
+                    std::string to_id = related->value("uniqueId", "");
+                    edges.push_back({{"from", from_id}, {"to", to_id}});
+
+                    if (!to_id.empty() && visited.insert(to_id).second)
+                        next_frontier.push_back(*related);
+                }
+            }
+
+            if (next_frontier.empty())
+                break;
+
+            paths_out.push_back({{"relationship", field},
+                                  {"direction", reverse ? "reverse" : "forward"},
+                                  {"depth", depth},
+                                  {"edges", edges}});
+
+            for (const auto &obj : next_frontier)
+                result.push_back(obj);
+
+            frontier = next_frontier;
+        }
+
+        // A cycle can lead back to one of the original starting objects;
+        // exclude those from the output so results are strictly "newly
+        // reached objects," never an echo of what the walk started with.
+        json filtered_result = json::array();
+        for (const auto &obj : result)
+        {
+            std::string id = obj.value("uniqueId", "");
+            if (starting_ids.find(id) == starting_ids.end())
+                filtered_result.push_back(obj);
+        }
+
+        return filtered_result;
     }
 
     const char *plugin_name()
@@ -473,7 +923,13 @@ extern "C"
             // structured_query); absent here means absent on the forwarded
             // semantic_filter call, which is what preserves today's behavior.
             if (ast.contains("traverse")) fwd["traverse"] = ast["traverse"];
+            if (ast.contains("traverse_tree")) fwd["traverse_tree"] = ast["traverse_tree"];
+            if (ast.contains("traverse_recursive")) fwd["traverse_recursive"] = ast["traverse_recursive"];
+            if (ast.contains("include_paths")) fwd["include_paths"] = ast["include_paths"];
+            if (ast.contains("filters_after_traverse")) fwd["filters_after_traverse"] = ast["filters_after_traverse"];
             if (ast.contains("select")) fwd["select"] = ast["select"];
+            if (ast.contains("aggregate")) fwd["aggregate"] = ast["aggregate"];
+            if (ast.contains("constraints")) fwd["constraints"] = ast["constraints"];
             if (ast.contains("distinct")) fwd["distinct"] = ast["distinct"];
             if (ast.contains("group_by")) fwd["group_by"] = ast["group_by"];
             if (ast.contains("sort")) fwd["sort"] = ast["sort"];
@@ -494,6 +950,26 @@ extern "C"
             }
             // END TEMP-DEBUG(nlp-validation)
 
+            return true;
+        }
+
+        if (op == "set_query")
+        {
+            json fwd = {
+                {"action", "set_query"},
+                {"model", model},
+                {"expression", ast.value("expression", json::object())}};
+
+            if (ast.contains("include_paths")) fwd["include_paths"] = ast["include_paths"];
+            if (ast.contains("select")) fwd["select"] = ast["select"];
+            if (ast.contains("aggregate")) fwd["aggregate"] = ast["aggregate"];
+            if (ast.contains("constraints")) fwd["constraints"] = ast["constraints"];
+            if (ast.contains("distinct")) fwd["distinct"] = ast["distinct"];
+            if (ast.contains("group_by")) fwd["group_by"] = ast["group_by"];
+            if (ast.contains("sort")) fwd["sort"] = ast["sort"];
+            if (ast.contains("limit")) fwd["limit"] = ast["limit"];
+
+            response = handle_ifc_aiquery(fwd.dump());
             return true;
         }
 
@@ -1043,6 +1519,24 @@ extern "C"
         return require_all;
     }
 
+    // Applies a filter stage (the same eval_filters/eval_filter_clause engine
+    // above) to an arbitrary result set rather than the whole tree. Step 3
+    // (relationship-aware filtering) calls this once, right after
+    // traversal, so a filter can be re-evaluated on the objects traversal
+    // just produced; a future "filter -> traverse -> filter -> traverse ->
+    // filter" pipeline would just call this (and apply_traversal_chain)
+    // repeatedly in sequence -- neither needs to change for that.
+    static json apply_filters_stage(const json &sem, const json &items, const json &filters, const std::string &match)
+    {
+        json out = json::array();
+
+        for (const auto &item : items)
+            if (eval_filters(sem, item, filters, match))
+                out.push_back(item);
+
+        return out;
+    }
+
     // ------------------------------------------------------------------
     // Generic result shaping: select / distinct / group_by / sort / limit
     // (Step 1 extension). Everything here is field-name-agnostic, same as
@@ -1287,23 +1781,526 @@ extern "C"
         return out;
     }
 
-    static bool handle_action_semantic_filter(const json &req, const std::string &model, std::string &response)
+    // ------------------------------------------------------------------
+    // Step 6: graph aggregation.
+    //
+    // Aggregation runs after filtering/traversal (whatever "results"
+    // currently holds, regardless of how it got there) and never modifies
+    // eval_filters/eval_filter_clause or the traversal engine -- it only
+    // consumes traverse_relationship*/apply_traversal_chain to resolve a
+    // graph-based group_by, exactly the same functions "traverse" already
+    // uses.
+    // ------------------------------------------------------------------
+
+    static const std::unordered_set<std::string> &valid_aggregate_functions()
     {
-        std::string action = req.value("action", "");
-        if (action != "semantic_filter")
-            return false;
+        static const std::unordered_set<std::string> functions = {"count", "sum", "min", "max", "avg"};
+        return functions;
+    }
 
-        std::string sem_path = resolve_semantic_path_from_model(model);
+    // One aggregation metric: which function to compute, over which field
+    // (unused for count), with an explicit or default output key ("count",
+    // or "<function>_<field>" when not aliased via "as").
+    struct AggregateMetric
+    {
+        std::string function;
+        std::string field;
+        std::string alias;
+    };
 
-        json sem;
-        if (!load_json_mmap(sem_path, sem))
+    static std::vector<AggregateMetric> parse_aggregate_metrics(const json &v)
+    {
+        std::vector<AggregateMetric> metrics;
+
+        if (!v.is_array())
+            return metrics;
+
+        for (const auto &m : v)
         {
-            response = json({{"error", "semantic json not found"},
-                             {"path", sem_path}})
-                           .dump();
-            return true;
+            if (!m.is_object())
+                continue;
+
+            AggregateMetric metric;
+            metric.function = m.value("function", "");
+            metric.field = m.value("field", "");
+            metric.alias = m.value("as", metric.function == "count" ? "count" : (metric.function + "_" + metric.field));
+
+            metrics.push_back(metric);
         }
 
+        return metrics;
+    }
+
+    // Resolves the graph-based group identity/identities for one item: runs
+    // the given relationship chain through apply_traversal_chain exactly as
+    // "traverse" does (starting from a single-item set), then returns a
+    // lightweight identifier -- uniqueId, category, and intId when the node
+    // has one -- per node reached, never the full object. A chain step that
+    // fans out (a reverse hop reaching several nodes) makes this item
+    // contribute to every reached node's group, the same fan-out reverse
+    // traversal already has elsewhere.
+    static json graph_group_identities(const json &sem, const json &item, const std::vector<TraversalStep> &chain)
+    {
+        json single = json::array();
+        single.push_back(item);
+
+        json reached = apply_traversal_chain(sem, single, chain);
+
+        json identities = json::array();
+
+        for (const auto &node : reached)
+        {
+            json identity = {{"uniqueId", node.value("uniqueId", "")},
+                              {"category", node.value("category", json(nullptr))}};
+
+            if (node.contains("intId"))
+                identity["intId"] = node["intId"];
+
+            identities.push_back(identity);
+        }
+
+        return identities;
+    }
+
+    // Running per-group state for one or more metrics.
+    struct AggregateAccumulator
+    {
+        json group_value;
+        int64_t count = 0;
+        std::vector<double> sums;
+        std::vector<int64_t> numeric_counts;
+        std::vector<bool> has_min_max;
+        std::vector<double> mins;
+        std::vector<double> maxs;
+    };
+
+    // Computes count/sum/min/max/avg over `items`, optionally grouped.
+    // group_by is plain-attribute (resolved via resolve_path_with_fallback,
+    // same resolver select/distinct/sort already use) when `group_is_graph`
+    // is false, or graph-based (resolved via graph_group_identities, i.e.
+    // real traversal) when true. Metrics always resolve against the item's
+    // own attributes via resolve_path_with_fallback and json_value_to_number
+    // -- the same field resolution and numeric coercion used everywhere
+    // else in this engine, not reimplemented here.
+    static json aggregate_results(const json &sem, const json &items, bool has_group, bool group_is_graph,
+                                   const std::string &group_field, const std::vector<TraversalStep> &group_chain,
+                                   const std::vector<AggregateMetric> &metrics)
+    {
+        std::vector<std::string> order;
+        std::unordered_map<std::string, AggregateAccumulator> groups;
+
+        auto ensure_group = [&](const std::string &key, const json &group_value) -> AggregateAccumulator &
+        {
+            auto it = groups.find(key);
+            if (it != groups.end())
+                return it->second;
+
+            order.push_back(key);
+            AggregateAccumulator &acc = groups[key];
+            acc.group_value = group_value;
+            acc.sums.assign(metrics.size(), 0.0);
+            acc.numeric_counts.assign(metrics.size(), 0);
+            acc.has_min_max.assign(metrics.size(), false);
+            acc.mins.assign(metrics.size(), 0.0);
+            acc.maxs.assign(metrics.size(), 0.0);
+            return acc;
+        };
+
+        auto accumulate = [&](AggregateAccumulator &acc, const json &item)
+        {
+            acc.count++;
+
+            for (size_t i = 0; i < metrics.size(); ++i)
+            {
+                const auto &m = metrics[i];
+                if (m.function == "count")
+                    continue;
+
+                const json *v = resolve_path_with_fallback(sem, item, m.field);
+                double num;
+                if (!v || !json_value_to_number(*v, num))
+                    continue;
+
+                acc.sums[i] += num;
+                acc.numeric_counts[i] += 1;
+
+                if (!acc.has_min_max[i])
+                {
+                    acc.mins[i] = num;
+                    acc.maxs[i] = num;
+                    acc.has_min_max[i] = true;
+                }
+                else
+                {
+                    acc.mins[i] = std::min(acc.mins[i], num);
+                    acc.maxs[i] = std::max(acc.maxs[i], num);
+                }
+            }
+        };
+
+        for (const auto &item : items)
+        {
+            if (!has_group)
+            {
+                accumulate(ensure_group("", json(nullptr)), item);
+                continue;
+            }
+
+            if (group_is_graph)
+            {
+                json identities = graph_group_identities(sem, item, group_chain);
+
+                for (const auto &identity : identities)
+                {
+                    std::string key = identity.value("uniqueId", "");
+                    accumulate(ensure_group(key, identity), item);
+                }
+
+                continue;
+            }
+
+            const json *v = resolve_path_with_fallback(sem, item, group_field);
+            json group_value = v ? *v : json(nullptr);
+            std::string key = json_to_compare_string(group_value);
+            accumulate(ensure_group(key, group_value), item);
+        }
+
+        json out = json::array();
+
+        for (const auto &key : order)
+        {
+            const AggregateAccumulator &acc = groups[key];
+            json row = json::object();
+
+            if (has_group)
+                row["group"] = acc.group_value;
+
+            for (size_t i = 0; i < metrics.size(); ++i)
+            {
+                const auto &m = metrics[i];
+
+                if (m.function == "count")
+                    row[m.alias] = acc.count;
+                else if (m.function == "sum")
+                    row[m.alias] = acc.sums[i];
+                else if (m.function == "avg")
+                    row[m.alias] = acc.numeric_counts[i] > 0 ? json(acc.sums[i] / acc.numeric_counts[i]) : json(nullptr);
+                else if (m.function == "min")
+                    row[m.alias] = acc.has_min_max[i] ? json(acc.mins[i]) : json(nullptr);
+                else if (m.function == "max")
+                    row[m.alias] = acc.has_min_max[i] ? json(acc.maxs[i]) : json(nullptr);
+            }
+
+            out.push_back(row);
+        }
+
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    // Step 9: constraint evaluation.
+    //
+    // Unlike filtering, this never removes objects -- every evaluated
+    // object is returned, annotated with a pass/fail verdict per
+    // constraint. Two kinds of constraint:
+    //   - field constraint: {"field","op","value"} -- handed straight to
+    //     eval_filter_clause, unmodified, the exact same function filters
+    //     already use.
+    //   - graph constraint: {"traverse_tree": ..., "where": [...], "op",
+    //     "value"} -- the SAME traverse_tree grammar and parser/validator/
+    //     executor ("parse_traversal_forest"/"validate_traversal_forest"/
+    //     "apply_traversal_forest") the top-level traverse_tree request
+    //     field already uses, run on a single-item set (same trick Step 6's
+    //     graph_group_identities uses), then the reached set's size is
+    //     compared against `value`. "where" (optional) narrows the reached
+    //     set first via apply_filters_stage, unmodified.
+    // Does not modify eval_filters/eval_filter_clause, the traversal
+    // engine, aggregate_results, or the set-operation functions -- only
+    // consumes them.
+    // ------------------------------------------------------------------
+
+    static const std::unordered_set<std::string> &valid_constraint_count_ops()
+    {
+        static const std::unordered_set<std::string> ops = {"eq", "neq", "gt", "gte", "lt", "lte", "exists", "not_exists"};
+        return ops;
+    }
+
+    struct Constraint
+    {
+        std::string name;
+        bool is_graph;
+
+        json field_clause; // field constraint: the raw {field,op,value} object
+
+        std::vector<TraversalNode> tree; // graph constraint: parsed traverse_tree
+        json where_filters;
+        std::string count_op;
+        double count_value;
+    };
+
+    static std::vector<Constraint> parse_constraints(const json &v)
+    {
+        std::vector<Constraint> out;
+
+        if (!v.is_array())
+            return out;
+
+        int auto_index = 0;
+        for (const auto &c : v)
+        {
+            if (!c.is_object())
+                continue;
+
+            Constraint constraint;
+            constraint.name = c.value("name", "constraint_" + std::to_string(auto_index));
+            auto_index++;
+
+            if (c.contains("traverse_tree"))
+            {
+                constraint.is_graph = true;
+                constraint.tree = parse_traversal_forest(c["traverse_tree"]);
+                constraint.where_filters = (c.contains("where") && c["where"].is_array()) ? c["where"] : json::array();
+                constraint.count_op = c.value("op", "gte");
+                constraint.count_value = c.value("value", 1.0);
+            }
+            else
+            {
+                constraint.is_graph = false;
+                constraint.field_clause = c;
+            }
+
+            out.push_back(constraint);
+        }
+
+        return out;
+    }
+
+    // Validates every constraint: graph constraints' traverse_tree is
+    // validated with the exact same validate_traversal_forest used for the
+    // top-level traverse_tree field, and the count-comparison operator is
+    // checked against valid_constraint_count_ops. Field constraints aren't
+    // separately validated here -- eval_filter_clause already treats an
+    // unrecognized op as "never matches" rather than erroring, and that
+    // established behavior isn't something constraint evaluation should
+    // second-guess.
+    static std::string validate_constraints(const json &sem, const std::vector<Constraint> &constraints)
+    {
+        for (const auto &c : constraints)
+        {
+            if (!c.is_graph)
+                continue;
+
+            std::string tree_error = validate_traversal_forest(sem, c.tree);
+            if (!tree_error.empty())
+                return tree_error;
+
+            if (!valid_constraint_count_ops().count(c.count_op))
+                return "Unknown constraint operator: \"" + c.count_op + "\"";
+        }
+
+        return "";
+    }
+
+    static bool evaluate_graph_constraint(const json &sem, const json &item, const Constraint &c)
+    {
+        json single = json::array();
+        single.push_back(item);
+
+        json unused_paths = json::array();
+        json reached = apply_traversal_forest(sem, single, c.tree, unused_paths);
+
+        if (!c.where_filters.empty())
+            reached = apply_filters_stage(sem, reached, c.where_filters, "all");
+
+        double count = static_cast<double>(reached.size());
+
+        if (c.count_op == "exists")
+            return count > 0;
+        if (c.count_op == "not_exists")
+            return count == 0;
+        if (c.count_op == "eq")
+            return count == c.count_value;
+        if (c.count_op == "neq")
+            return count != c.count_value;
+        if (c.count_op == "gt")
+            return count > c.count_value;
+        if (c.count_op == "gte")
+            return count >= c.count_value;
+        if (c.count_op == "lt")
+            return count < c.count_value;
+        if (c.count_op == "lte")
+            return count <= c.count_value;
+
+        return false;
+    }
+
+    // Evaluates every constraint against every item, returning a full copy
+    // of each item (nothing removed, nothing reshaped) with an added
+    // "constraints" object mapping each constraint's name to its pass/fail
+    // verdict for that item.
+    static json evaluate_constraints(const json &sem, const json &items, const std::vector<Constraint> &constraints)
+    {
+        json out = json::array();
+
+        for (const auto &item : items)
+        {
+            json annotated = item;
+            json verdicts = json::object();
+
+            for (const auto &c : constraints)
+            {
+                bool pass = c.is_graph
+                                ? evaluate_graph_constraint(sem, item, c)
+                                : eval_filter_clause(sem, item, c.field_clause);
+                verdicts[c.name] = pass;
+            }
+
+            annotated["constraints"] = verdicts;
+            out.push_back(annotated);
+        }
+
+        return out;
+    }
+
+    // Applies the shape/aggregate -> sort -> limit stages to an
+    // already-computed results array and builds the final response object
+    // on top of `base_response` (which already carries whatever envelope
+    // fields the caller owns, e.g. {"action","match","filters"} for a
+    // normal query or {"action":"set_query"} for a combined set-operation
+    // result). Used both by execute_semantic_filter_query (after its own
+    // filter+traverse+filters_after_traverse stage) and directly by
+    // handle_action_set_query (Step 8) on a combined set-operation result --
+    // neither has anything to do with HOW `results` was produced, so this
+    // function doesn't need to know either. This is the exact tail that
+    // used to live inline in handle_action_semantic_filter; behavior is
+    // unchanged for that caller, just relocated so a second caller can
+    // reuse it without duplicating the shape/sort/limit dispatch.
+    static json apply_post_processing_and_respond(const json &sem, const json &results, const json &req, json base_response)
+    {
+        bool has_group_by = req.contains("group_by") && req["group_by"].is_string() && !req["group_by"].get<std::string>().empty();
+        bool has_distinct = req.contains("distinct") && !to_field_list(req["distinct"]).empty();
+        bool has_select = req.contains("select") && !to_field_list(req["select"]).empty();
+        bool has_aggregate = req.contains("aggregate") && req["aggregate"].is_object();
+        bool has_constraints = req.contains("constraints") && req["constraints"].is_array() && !req["constraints"].empty();
+
+        int shape_count = (has_group_by ? 1 : 0) + (has_distinct ? 1 : 0) + (has_select ? 1 : 0) + (has_aggregate ? 1 : 0) + (has_constraints ? 1 : 0);
+        if (shape_count > 1)
+            return json({{"error", "group_by, distinct, select, aggregate, and constraints are mutually exclusive"}});
+
+        json shaped = results;
+
+        if (has_group_by)
+            shaped = group_by_results(sem, results, req["group_by"].get<std::string>());
+        else if (has_distinct)
+            shaped = distinct_results(sem, results, to_field_list(req["distinct"]));
+        else if (has_select)
+            shaped = select_results(sem, results, to_field_list(req["select"]));
+        else if (has_aggregate)
+        {
+            const json &agg = req["aggregate"];
+
+            bool agg_has_group = agg.contains("group_by") && !agg["group_by"].is_null();
+            bool agg_group_is_graph = agg_has_group && agg["group_by"].is_object() && agg["group_by"].contains("relationship");
+            std::string agg_group_field;
+            std::vector<TraversalStep> agg_group_chain;
+
+            if (agg_has_group)
+            {
+                if (agg_group_is_graph)
+                {
+                    agg_group_chain = to_traversal_steps(agg["group_by"]["relationship"]);
+
+                    std::string chain_error = validate_traversal_steps(sem, agg_group_chain);
+                    if (!chain_error.empty())
+                        return json({{"error", chain_error}});
+                }
+                else if (agg["group_by"].is_string())
+                {
+                    agg_group_field = agg["group_by"].get<std::string>();
+                }
+                else
+                {
+                    return json({{"error", "aggregate.group_by must be a field name string or {\"relationship\": ...}"}});
+                }
+            }
+
+            std::vector<AggregateMetric> metrics = parse_aggregate_metrics(agg.value("metrics", json::array()));
+
+            for (const auto &m : metrics)
+            {
+                if (!valid_aggregate_functions().count(m.function))
+                    return json({{"error", "Unknown aggregate function: \"" + m.function + "\""}});
+            }
+
+            shaped = aggregate_results(sem, results, agg_has_group, agg_group_is_graph, agg_group_field, agg_group_chain, metrics);
+        }
+        else if (has_constraints)
+        {
+            std::vector<Constraint> constraints = parse_constraints(req["constraints"]);
+
+            std::string constraint_error = validate_constraints(sem, constraints);
+            if (!constraint_error.empty())
+                return json({{"error", constraint_error}});
+
+            shaped = evaluate_constraints(sem, results, constraints);
+        }
+
+        bool has_sort = req.contains("sort") && req["sort"].is_object();
+        if (has_sort)
+        {
+            std::string sort_field = req["sort"].value("field", "");
+            std::string sort_order = req["sort"].value("order", "asc");
+            sort_results(sem, shaped, sort_field, sort_order == "desc");
+        }
+
+        size_t shaped_count = shaped.size();
+
+        bool has_limit = req.contains("limit") && req["limit"].is_number_integer();
+        if (has_limit)
+        {
+            int64_t lim = req["limit"].get<int64_t>();
+            if (lim < 0)
+                lim = 0;
+
+            if (static_cast<size_t>(lim) < shaped.size())
+            {
+                json truncated = json::array();
+                for (int64_t i = 0; i < lim; ++i)
+                    truncated.push_back(shaped[static_cast<size_t>(i)]);
+                shaped = truncated;
+            }
+        }
+
+        base_response["count"] = shaped_count;
+        base_response["results"] = shaped;
+
+        if (has_group_by)
+            base_response["group_by"] = req["group_by"];
+        if (has_distinct)
+            base_response["distinct"] = req["distinct"];
+        if (has_select)
+            base_response["select"] = req["select"];
+        if (has_aggregate)
+            base_response["aggregate"] = req["aggregate"];
+        if (has_constraints)
+            base_response["constraints"] = req["constraints"];
+        if (has_sort)
+            base_response["sort"] = req["sort"];
+        if (has_limit)
+            base_response["limit"] = req["limit"];
+
+        return base_response;
+    }
+
+    // The full semantic_filter pipeline -- filter walk, traverse/traverse_tree,
+    // filters_after_traverse, then apply_post_processing_and_respond -- given
+    // an ALREADY-LOADED semantic tree, returning the response as a json
+    // object directly (no serialization). This is the one place the pipeline
+    // actually runs; handle_action_semantic_filter (below) and Step 8's set-
+    // query leaves both call it directly, in-process -- leaves never
+    // serialize to a string or re-enter the action dispatcher.
+    static json execute_semantic_filter_query(const json &sem, const json &req)
+    {
         json filters = (req.contains("filters") && req["filters"].is_array())
                            ? req["filters"]
                            : json::array();
@@ -1336,96 +2333,421 @@ extern "C"
 
         std::vector<TraversalStep> traverse_chain = to_traversal_steps(req.value("traverse", json::array()));
         bool has_traverse = !traverse_chain.empty();
+        bool has_traverse_tree = req.contains("traverse_tree") && !req["traverse_tree"].is_null();
+        bool has_traverse_recursive = req.contains("traverse_recursive") && req["traverse_recursive"].is_object();
+        bool include_paths = req.value("include_paths", false);
+        json paths = json::array();
+
+        int traversal_mode_count = (has_traverse ? 1 : 0) + (has_traverse_tree ? 1 : 0) + (has_traverse_recursive ? 1 : 0);
+        if (traversal_mode_count > 1)
+            return json({{"error", "traverse, traverse_tree, and traverse_recursive are mutually exclusive"}});
 
         if (has_traverse)
         {
-            for (const auto &step : traverse_chain)
-            {
-                if (classification_link_fields().count(step.field))
-                {
-                    response = json({{"error", "\"" + step.field + "\" is a classification link, not a traversal relationship"}}).dump();
-                    return true;
-                }
+            std::string chain_error = validate_traversal_steps(sem, traverse_chain);
+            if (!chain_error.empty())
+                return json({{"error", chain_error}});
 
-                if (!relationship_exists_in_schema(sem, step.field))
-                {
-                    response = json({{"error", "Unknown traversal relationship: \"" + step.field + "\""}}).dump();
-                    return true;
-                }
+            results = include_paths
+                          ? apply_traversal_chain_with_paths(sem, results, traverse_chain, paths)
+                          : apply_traversal_chain(sem, results, traverse_chain);
+        }
+        else if (has_traverse_tree)
+        {
+            std::vector<TraversalNode> forest = parse_traversal_forest(req["traverse_tree"]);
+
+            std::string tree_error = validate_traversal_forest(sem, forest);
+            if (!tree_error.empty())
+                return json({{"error", tree_error}});
+
+            results = apply_traversal_forest(sem, results, forest, paths);
+        }
+        else if (has_traverse_recursive)
+        {
+            const json &rec = req["traverse_recursive"];
+            std::string field = rec.value("field", "");
+
+            if (field.empty())
+                return json({{"error", "traverse_recursive requires a \"field\""}});
+
+            bool reverse = rec.value("direction", "forward") == "reverse";
+
+            // -1 is the "omitted" sentinel, distinct from an explicit 0 (zero
+            // hops) -- .value()'s single-default form can't tell those apart.
+            int64_t max_depth = -1;
+            if (rec.contains("max_depth") && !rec["max_depth"].is_null())
+            {
+                if (!rec["max_depth"].is_number_integer())
+                    return json({{"error", "traverse_recursive \"max_depth\" must be an integer"}});
+
+                max_depth = rec["max_depth"].get<int64_t>();
+                if (max_depth < 0)
+                    return json({{"error", "traverse_recursive \"max_depth\" must be >= 0"}});
             }
 
-            results = apply_traversal_chain(sem, results, traverse_chain);
+            std::vector<TraversalStep> single_step = {{field, reverse}};
+            std::string rel_error = validate_traversal_steps(sem, single_step);
+            if (!rel_error.empty())
+                return json({{"error", rel_error}});
+
+            results = apply_recursive_traversal(sem, results, field, reverse, max_depth, paths);
         }
 
-        bool has_group_by = req.contains("group_by") && req["group_by"].is_string() && !req["group_by"].get<std::string>().empty();
-        bool has_distinct = req.contains("distinct") && !to_field_list(req["distinct"]).empty();
-        bool has_select = req.contains("select") && !to_field_list(req["select"]).empty();
+        json filters_after_traverse = (req.contains("filters_after_traverse") && req["filters_after_traverse"].is_array())
+                                           ? req["filters_after_traverse"]
+                                           : json::array();
+        bool has_filters_after_traverse = !filters_after_traverse.empty();
 
-        int shape_count = (has_group_by ? 1 : 0) + (has_distinct ? 1 : 0) + (has_select ? 1 : 0);
-        if (shape_count > 1)
-        {
-            response = json({{"error", "group_by, distinct, and select are mutually exclusive"}}).dump();
-            return true;
-        }
+        if (has_filters_after_traverse)
+            results = apply_filters_stage(sem, results, filters_after_traverse, "all");
 
-        json shaped = results;
-
-        if (has_group_by)
-            shaped = group_by_results(sem, results, req["group_by"].get<std::string>());
-        else if (has_distinct)
-            shaped = distinct_results(sem, results, to_field_list(req["distinct"]));
-        else if (has_select)
-            shaped = select_results(sem, results, to_field_list(req["select"]));
-
-        bool has_sort = req.contains("sort") && req["sort"].is_object();
-        if (has_sort)
-        {
-            std::string sort_field = req["sort"].value("field", "");
-            std::string sort_order = req["sort"].value("order", "asc");
-            sort_results(sem, shaped, sort_field, sort_order == "desc");
-        }
-
-        size_t shaped_count = shaped.size();
-
-        bool has_limit = req.contains("limit") && req["limit"].is_number_integer();
-        if (has_limit)
-        {
-            int64_t lim = req["limit"].get<int64_t>();
-            if (lim < 0)
-                lim = 0;
-
-            if (static_cast<size_t>(lim) < shaped.size())
-            {
-                json truncated = json::array();
-                for (int64_t i = 0; i < lim; ++i)
-                    truncated.push_back(shaped[static_cast<size_t>(i)]);
-                shaped = truncated;
-            }
-        }
-
-        json resp = {{"plugin", "AIQuery"},
+        json base = {{"plugin", "AIQuery"},
                      {"status", "ok"},
                      {"action", "semantic_filter"},
                      {"match", match},
-                     {"filters", filters},
-                     {"count", shaped_count},
-                     {"results", shaped}};
+                     {"filters", filters}};
 
         if (has_traverse)
-            resp["traverse"] = req["traverse"];
-        if (has_group_by)
-            resp["group_by"] = req["group_by"];
-        if (has_distinct)
-            resp["distinct"] = req["distinct"];
-        if (has_select)
-            resp["select"] = req["select"];
-        if (has_sort)
-            resp["sort"] = req["sort"];
-        if (has_limit)
-            resp["limit"] = req["limit"];
+            base["traverse"] = req["traverse"];
+        if (has_traverse_tree)
+            base["traverse_tree"] = req["traverse_tree"];
+        if (has_traverse_recursive)
+            base["traverse_recursive"] = req["traverse_recursive"];
+        if ((has_traverse || has_traverse_tree || has_traverse_recursive) && include_paths)
+            base["paths"] = paths;
+        if (has_filters_after_traverse)
+            base["filters_after_traverse"] = filters_after_traverse;
 
-        response = resp.dump();
+        return apply_post_processing_and_respond(sem, results, req, base);
+    }
 
+    static bool handle_action_semantic_filter(const json &req, const std::string &model, std::string &response)
+    {
+        std::string action = req.value("action", "");
+        if (action != "semantic_filter")
+            return false;
+
+        std::string sem_path = resolve_semantic_path_from_model(model);
+
+        json sem;
+        if (!load_json_mmap(sem_path, sem))
+        {
+            response = json({{"error", "semantic json not found"},
+                             {"path", sem_path}})
+                           .dump();
+            return true;
+        }
+
+        response = execute_semantic_filter_query(sem, req).dump();
+        return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Step 8: set operations.
+    //
+    // Combines the object sets produced by independent subqueries (union/
+    // intersect/difference), each subquery executed via
+    // execute_semantic_filter_query directly -- no re-entry into the
+    // public action dispatcher, no string serialization between leaves.
+    // Does not modify eval_filters/eval_filter_clause, the traversal engine,
+    // or aggregate_results -- it only ever consumes their output through
+    // execute_semantic_filter_query.
+    // ------------------------------------------------------------------
+
+    static json set_union(const std::vector<json> &operand_sets)
+    {
+        std::unordered_set<std::string> seen;
+        json out = json::array();
+
+        for (const auto &set : operand_sets)
+            for (const auto &obj : set)
+            {
+                std::string id = obj.value("uniqueId", "");
+                if (id.empty() || seen.insert(id).second)
+                    out.push_back(obj);
+            }
+
+        return out;
+    }
+
+    static json set_intersect(const std::vector<json> &operand_sets)
+    {
+        json out = json::array();
+        if (operand_sets.empty())
+            return out;
+
+        std::vector<std::unordered_set<std::string>> id_sets;
+        for (const auto &set : operand_sets)
+        {
+            std::unordered_set<std::string> ids;
+            for (const auto &obj : set)
+                ids.insert(obj.value("uniqueId", ""));
+            id_sets.push_back(ids);
+        }
+
+        std::unordered_set<std::string> seen;
+        for (const auto &obj : operand_sets[0])
+        {
+            std::string id = obj.value("uniqueId", "");
+            if (id.empty() || seen.count(id))
+                continue;
+
+            bool in_all = true;
+            for (size_t i = 1; i < id_sets.size(); ++i)
+            {
+                if (!id_sets[i].count(id))
+                {
+                    in_all = false;
+                    break;
+                }
+            }
+
+            if (in_all)
+            {
+                seen.insert(id);
+                out.push_back(obj);
+            }
+        }
+
+        return out;
+    }
+
+    // operands[0] minus the union of every other operand.
+    static json set_difference(const std::vector<json> &operand_sets)
+    {
+        json out = json::array();
+        if (operand_sets.empty())
+            return out;
+
+        std::unordered_set<std::string> excluded;
+        for (size_t i = 1; i < operand_sets.size(); ++i)
+            for (const auto &obj : operand_sets[i])
+                excluded.insert(obj.value("uniqueId", ""));
+
+        std::unordered_set<std::string> seen;
+        for (const auto &obj : operand_sets[0])
+        {
+            std::string id = obj.value("uniqueId", "");
+            if (id.empty() || seen.count(id) || excluded.count(id))
+                continue;
+
+            seen.insert(id);
+            out.push_back(obj);
+        }
+
+        return out;
+    }
+
+    // Recursively prunes a Step-5 (traverse_tree) shaped path node's edges,
+    // and its "then" children if any, so only edges on a chain to a
+    // surviving final object remain. Returns the set of "from" ids that
+    // survived at this node -- which of its own source objects still lead
+    // somewhere that matters -- for the caller (parent node) to decide
+    // which of ITS OWN edges to keep. A node with no "then" is a leaf hop
+    // and prunes directly against the final survivor set.
+    static std::unordered_set<std::string> prune_tree_path_node(json &node, const std::unordered_set<std::string> &final_survivors)
+    {
+        std::unordered_set<std::string> required_from;
+
+        if (node.contains("then") && node["then"].is_array() && !node["then"].empty())
+        {
+            std::unordered_set<std::string> needed_targets;
+
+            for (auto &child : node["then"])
+            {
+                std::unordered_set<std::string> child_from = prune_tree_path_node(child, final_survivors);
+                needed_targets.insert(child_from.begin(), child_from.end());
+            }
+
+            json kept_edges = json::array();
+            for (const auto &edge : node["edges"])
+            {
+                std::string to = edge.value("to", "");
+                if (needed_targets.count(to))
+                {
+                    kept_edges.push_back(edge);
+                    required_from.insert(edge.value("from", ""));
+                }
+            }
+            node["edges"] = kept_edges;
+        }
+        else
+        {
+            json kept_edges = json::array();
+            for (const auto &edge : node["edges"])
+            {
+                std::string to = edge.value("to", "");
+                if (final_survivors.count(to))
+                {
+                    kept_edges.push_back(edge);
+                    required_from.insert(edge.value("from", ""));
+                }
+            }
+            node["edges"] = kept_edges;
+        }
+
+        return required_from;
+    }
+
+    static void prune_tree_paths(json &paths, const std::unordered_set<std::string> &final_survivors)
+    {
+        for (auto &root : paths)
+            prune_tree_path_node(root, final_survivors);
+    }
+
+    // Prunes a Step-4 (flat chain) shaped paths array backward: the last hop
+    // is pruned against the final survivor set, then each earlier hop is
+    // pruned against the set of "from" values the NEXT hop actually kept --
+    // "which hop feeds which" is implicit in array order for this shape,
+    // unlike the tree shape's explicit "then" nesting.
+    static void prune_flat_paths(json &paths, const std::unordered_set<std::string> &final_survivors)
+    {
+        std::unordered_set<std::string> required_to = final_survivors;
+
+        for (int i = static_cast<int>(paths.size()) - 1; i >= 0; --i)
+        {
+            json &hop = paths[static_cast<size_t>(i)];
+            json kept_edges = json::array();
+            std::unordered_set<std::string> required_from;
+
+            for (const auto &edge : hop["edges"])
+            {
+                std::string to = edge.value("to", "");
+                if (required_to.count(to))
+                {
+                    kept_edges.push_back(edge);
+                    required_from.insert(edge.value("from", ""));
+                }
+            }
+
+            hop["edges"] = kept_edges;
+            required_to = required_from;
+        }
+    }
+
+    // Executes one node of a set expression (a leaf query or a nested set
+    // operation), returning either {"error": "..."} or a plain array of
+    // semantic objects. Leaves execute via execute_semantic_filter_query
+    // directly, in-process. Leaf path output (if requested) is collected
+    // into leaf_paths_out, tagged by an incrementing leaf index, for
+    // pruning against the FINAL survivor set once the whole tree resolves
+    // (handle_action_set_query does the pruning, not this function, since
+    // "final" only means anything once every operand has run).
+    static json execute_set_operand(const json &sem, const json &node, bool force_include_paths, json &leaf_paths_out, int &next_leaf_index)
+    {
+        bool is_set_op = node.is_object() && node.contains("operation") &&
+                         (node["operation"] == "union" || node["operation"] == "intersect" || node["operation"] == "difference");
+
+        if (is_set_op)
+        {
+            std::string op = node.value("operation", "");
+
+            if (!node.contains("operands") || !node["operands"].is_array() || node["operands"].empty())
+                return json({{"error", "set operation \"" + op + "\" requires a non-empty operands array"}});
+
+            std::vector<json> operand_sets;
+            for (const auto &child : node["operands"])
+            {
+                json result = execute_set_operand(sem, child, force_include_paths, leaf_paths_out, next_leaf_index);
+                if (result.is_object() && result.contains("error"))
+                    return result;
+                operand_sets.push_back(result);
+            }
+
+            if (op == "union")
+                return set_union(operand_sets);
+            if (op == "intersect")
+                return set_intersect(operand_sets);
+            return set_difference(operand_sets);
+        }
+
+        // Leaf: an ordinary query object, executed via the exact same
+        // pipeline any other query uses.
+        json leaf_req = node;
+        if (force_include_paths)
+            leaf_req["include_paths"] = true;
+
+        json leaf_response = execute_semantic_filter_query(sem, leaf_req);
+
+        if (leaf_response.contains("error"))
+            return leaf_response;
+
+        if (!leaf_response.contains("results") || !leaf_response["results"].is_array())
+            return json({{"error", "set operation operand did not produce a result array"}});
+
+        for (const auto &obj : leaf_response["results"])
+        {
+            if (!obj.is_object() || !obj.contains("uniqueId"))
+                return json({{"error", "set operation operands must produce semantic objects (with uniqueId), not select/group_by/distinct/aggregate rows"}});
+        }
+
+        if (leaf_response.contains("paths"))
+        {
+            json entry = {{"leaf", next_leaf_index}, {"paths", leaf_response["paths"]}};
+            entry["shape"] = leaf_response.contains("traverse_tree") ? "tree" : "flat";
+            leaf_paths_out.push_back(entry);
+        }
+
+        next_leaf_index++;
+
+        return leaf_response["results"];
+    }
+
+    static bool handle_action_set_query(const json &req, const std::string &model, std::string &response)
+    {
+        std::string action = req.value("action", "");
+        if (action != "set_query")
+            return false;
+
+        if (!req.contains("expression") || !req["expression"].is_object())
+        {
+            response = json({{"error", "missing expression"}}).dump();
+            return true;
+        }
+
+        std::string sem_path = resolve_semantic_path_from_model(model);
+
+        json sem;
+        if (!load_json_mmap(sem_path, sem))
+        {
+            response = json({{"error", "semantic json not found"},
+                             {"path", sem_path}})
+                           .dump();
+            return true;
+        }
+
+        bool include_paths = req.value("include_paths", false);
+        json leaf_paths = json::array();
+        int next_leaf_index = 0;
+
+        json combined = execute_set_operand(sem, req["expression"], include_paths, leaf_paths, next_leaf_index);
+
+        if (combined.is_object() && combined.contains("error"))
+        {
+            response = combined.dump();
+            return true;
+        }
+
+        json base = {{"plugin", "AIQuery"}, {"status", "ok"}, {"action", "set_query"}};
+
+        if (include_paths && !leaf_paths.empty())
+        {
+            std::unordered_set<std::string> final_survivors;
+            for (const auto &obj : combined)
+                final_survivors.insert(obj.value("uniqueId", ""));
+
+            for (auto &entry : leaf_paths)
+            {
+                if (entry.value("shape", "") == "tree")
+                    prune_tree_paths(entry["paths"], final_survivors);
+                else
+                    prune_flat_paths(entry["paths"], final_survivors);
+            }
+
+            base["paths"] = leaf_paths;
+        }
+
+        response = apply_post_processing_and_respond(sem, combined, req, base).dump();
         return true;
     }
 
@@ -1779,6 +3101,9 @@ extern "C"
                 return response.c_str();
 
             if (handle_action_semantic_filter(req, model, response))
+                return response.c_str();
+
+            if (handle_action_set_query(req, model, response))
                 return response.c_str();
 
             if (handle_action_search_elements(req, model, response))

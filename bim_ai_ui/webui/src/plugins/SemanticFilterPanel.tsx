@@ -159,6 +159,19 @@ export default function SemanticFilterPanel({ selectedModel }: { selectedModel: 
       )}
       {/* END TEMP-DEBUG(nlp-validation) */}
 
+      {/* TEMP-DEBUG(step4-paths): remove or redesign once Step 4 (relationship
+          path preservation) has been validated. Renders response.paths exactly
+          as returned by the backend, no interpretation. */}
+      {response && response.paths && (
+        <div className="sfp-section">
+          <label className="sfp-label">Paths (Temporary Debug View)</label>
+          <pre className="sfp-json sfp-debug-json">
+            {JSON.stringify(response.paths, null, 2)}
+          </pre>
+        </div>
+      )}
+      {/* END TEMP-DEBUG(step4-paths) */}
+
       {results && (
         <div className="sfp-section">
           <div className="sfp-count">
