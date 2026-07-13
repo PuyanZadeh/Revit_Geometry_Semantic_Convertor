@@ -191,41 +191,97 @@ extern "C"
         }
     }
 
-    static const json *find_semantic_by_unique_id(const json &sem, const std::string &uniqueId)
+    // Step 12 optimization #1: uniqueId -> object index.
+    //
+    // find_semantic_by_unique_id used to do a full linear scan over every
+    // bucket/item for every single lookup -- the single most-called
+    // primitive in the engine (every forward traversal hop, and every
+    // type-inheritance fallback triggered whenever a filter/select/sort/
+    // group_by/aggregate/constraint field isn't present directly on the
+    // instance). Building this index once per request turns that into an
+    // O(1) lookup, without changing any lookup's observable result.
+    //
+    // Built explicitly per request (build_unique_id_index, called once by
+    // each action handler right after load_json_mmap) and threaded through
+    // this lightweight context -- never cached in static/global state. The
+    // plugin has no state across requests (dlopen'd fresh per request), so
+    // there'd be nowhere safe to hide it even if that seemed convenient.
+    // Step 12 optimization #2: reverse-relationship index, keyed by field
+    // name (a bare field like "hostId" or a dotted path like
+    // "refs.fromRoomId" -- resolve_relationship_value already walks dotted
+    // paths, so the cache key is just whatever string the caller asked to
+    // reverse-traverse on, verbatim). Built lazily -- only the first time a
+    // given field is actually reverse-traversed in this request -- and
+    // reused for every subsequent reverse hop on that same field (including
+    // every depth of a recursive reverse walk). Like id_index, this lives in
+    // the per-request SemanticContext, never in static/global/thread-local
+    // state; the reference member itself is mutable so the cache can be
+    // filled in lazily even though callers only ever hold a const
+    // SemanticContext&.
+    // Step 12 optimization #2: reverse-relationship index, keyed by field
+    // name (a bare field like "hostId" or a dotted path like
+    // "refs.fromRoomId" -- resolve_relationship_value already walks dotted
+    // paths, so the cache key is just whatever string the caller asked to
+    // reverse-traverse on, verbatim). Built lazily -- only the first time a
+    // given field is actually reverse-traversed in this request -- and
+    // reused for every subsequent reverse hop on that same field (including
+    // every depth of a recursive reverse walk). Like id_index, this lives in
+    // the per-request SemanticContext, never in static/global/thread-local
+    // state; the reference member itself is mutable so the cache can be
+    // filled in lazily even though callers only ever hold a const
+    // SemanticContext&.
+    struct SemanticContext
     {
-        if (!sem.is_object())
-            return nullptr;
+        const json &tree;
+        const std::unordered_map<std::string, const json *> &id_index;
+        std::unordered_map<std::string, std::unordered_map<std::string, std::vector<const json *>>> &reverse_index_cache;
+    };
 
-        for (const auto &group : sem.items())
-        {
-            const json &bucket = group.value();
+    // Builds the index in one O(N) pass, reusing for_each_semantic_item so
+    // the walk order is identical to find_semantic_by_unique_id's original
+    // scan (buckets in object-iteration order, items in array order). On a
+    // duplicate uniqueId the FIRST occurrence encountered wins here too --
+    // preserving the old linear scan's first-match behavior exactly.
+    // Duplicates are logged rather than treated as errors, so Step 12
+    // testing can report how many (if any) exist in a given model.
+    static std::unordered_map<std::string, const json *> build_unique_id_index(const json &sem)
+    {
+        std::unordered_map<std::string, const json *> index;
+        size_t duplicate_count = 0;
 
-            if (!bucket.is_object())
-                continue;
+        for_each_semantic_item(sem, [&](const json &item)
+                                {
+            std::string id = item.value("uniqueId", "");
+            if (id.empty())
+                return;
 
-            if (!bucket.contains("items") || !bucket["items"].is_array())
-                continue;
-
-            for (const auto &item : bucket["items"])
+            if (index.find(id) != index.end())
             {
-                if (!item.is_object())
-                    continue;
-
-                if (item.value("uniqueId", "") == uniqueId)
-                    return &item;
+                duplicate_count++;
+                return;
             }
-        }
 
-        return nullptr;
+            index[id] = &item; });
+
+        if (duplicate_count > 0)
+            dbg("build_unique_id_index duplicate uniqueId count:", std::to_string(duplicate_count));
+
+        return index;
     }
 
-    static const json *find_next_semantic_context(const json &sem, const json &element)
+    static const json *find_semantic_by_unique_id(const SemanticContext &ctx, const std::string &uniqueId)
+    {
+        auto it = ctx.id_index.find(uniqueId);
+        return it != ctx.id_index.end() ? it->second : nullptr;
+    }
+
+    static const json *find_next_semantic_context(const SemanticContext &ctx, const json &element)
     {
         if (!element.is_object())
             return nullptr;
 
         if (element.contains("hostId") && element["hostId"].is_string())
-            return find_semantic_by_unique_id(sem, element["hostId"].get<std::string>());
+            return find_semantic_by_unique_id(ctx, element["hostId"].get<std::string>());
 
         return nullptr;
     }
@@ -337,13 +393,13 @@ extern "C"
     // object it references, or nullptr if the field is absent or doesn't
     // resolve. Generic over the field name -- callers decide what's a valid
     // relationship to ask for; this function just follows it.
-    static const json *traverse_relationship(const json &sem, const json &item, const std::string &relationship)
+    static const json *traverse_relationship(const SemanticContext &ctx, const json &item, const std::string &relationship)
     {
         const json *value = resolve_relationship_value(item, relationship);
         if (!value || !value->is_string())
             return nullptr;
 
-        return find_semantic_by_unique_id(sem, value->get<std::string>());
+        return find_semantic_by_unique_id(ctx, value->get<std::string>());
     }
 
     // Applies one traversal hop across a whole result set: each item's
@@ -351,14 +407,14 @@ extern "C"
     // uniqueId (first-seen order) so multiple starting items that share the
     // same connected object don't produce duplicates. Items that don't
     // resolve contribute nothing (there is no connected object to return).
-    static json traverse_results(const json &sem, const json &items, const std::string &relationship)
+    static json traverse_results(const SemanticContext &ctx, const json &items, const std::string &relationship)
     {
         std::unordered_set<std::string> seen;
         json out = json::array();
 
         for (const auto &item : items)
         {
-            const json *related = traverse_relationship(sem, item, relationship);
+            const json *related = traverse_relationship(ctx, item, relationship);
             if (!related)
                 continue;
 
@@ -372,13 +428,47 @@ extern "C"
         return out;
     }
 
+    // Builds (or returns the already-built) reverse index for one
+    // relationship field: target uniqueId -> every object whose
+    // `relationship` field points at it. `relationship` is passed straight
+    // to resolve_relationship_value unchanged, so a dotted path like
+    // "refs.fromRoomId" is indexed exactly as correctly as a bare field like
+    // "hostId" -- the field-name string is just an opaque cache key here;
+    // this function never interprets it beyond that.
+    //
+    // One O(N) pass over the whole model builds the WHOLE index for this
+    // field in one go (rather than one scan per starting item), bucketing
+    // each candidate under whichever target it references, in tree-walk
+    // order -- so for any given target, its bucket's order is identical to
+    // what a dedicated linear scan for just that target would have produced
+    // (same fixed walk order either way). Cached in the per-request context
+    // so a second reverse hop on the same field (including every depth of a
+    // recursive reverse walk) never rebuilds it.
+    static const std::unordered_map<std::string, std::vector<const json *>> &get_or_build_reverse_index(const SemanticContext &ctx, const std::string &relationship)
+    {
+        auto cached = ctx.reverse_index_cache.find(relationship);
+        if (cached != ctx.reverse_index_cache.end())
+            return cached->second;
+
+        std::unordered_map<std::string, std::vector<const json *>> index;
+
+        for_each_semantic_item(ctx.tree, [&](const json &candidate)
+                                {
+            const json *value = resolve_relationship_value(candidate, relationship);
+            if (value && value->is_string())
+                index[value->get<std::string>()].push_back(&candidate); });
+
+        auto inserted = ctx.reverse_index_cache.emplace(relationship, std::move(index));
+        return inserted.first->second;
+    }
+
     // Reverse hop: finds every semantic object anywhere in the tree whose
     // `relationship` field points AT `item`'s own uniqueId -- the mirror
     // image of traverse_relationship (which follows a reference FROM item).
     // Inherently one-to-many (many objects can host off of the same wall),
-    // so this returns an array rather than a single object. Reuses
-    // for_each_semantic_item instead of re-walking the tree itself.
-    static json traverse_relationship_reverse(const json &sem, const json &item, const std::string &relationship)
+    // so this returns an array rather than a single object. Looks the target
+    // up in the lazily-built reverse index instead of re-scanning the tree.
+    static json traverse_relationship_reverse(const SemanticContext &ctx, const json &item, const std::string &relationship)
     {
         json out = json::array();
 
@@ -386,11 +476,13 @@ extern "C"
         if (target_id.empty())
             return out;
 
-        for_each_semantic_item(sem, [&](const json &candidate)
-                                {
-            const json *value = resolve_relationship_value(candidate, relationship);
-            if (value && value->is_string() && value->get<std::string>() == target_id)
-                out.push_back(candidate); });
+        const auto &reverse_index = get_or_build_reverse_index(ctx, relationship);
+        auto matches = reverse_index.find(target_id);
+        if (matches == reverse_index.end())
+            return out;
+
+        for (const json *candidate : matches->second)
+            out.push_back(*candidate);
 
         return out;
     }
@@ -399,14 +491,14 @@ extern "C"
     // referencing any of `items` via `relationship` is collected,
     // deduplicated by uniqueId (first-seen order) -- same dedup rule as the
     // forward direction's traverse_results.
-    static json traverse_results_reverse(const json &sem, const json &items, const std::string &relationship)
+    static json traverse_results_reverse(const SemanticContext &ctx, const json &items, const std::string &relationship)
     {
         std::unordered_set<std::string> seen;
         json out = json::array();
 
         for (const auto &item : items)
         {
-            json matches = traverse_relationship_reverse(sem, item, relationship);
+            json matches = traverse_relationship_reverse(ctx, item, relationship);
 
             for (const auto &match : matches)
             {
@@ -491,14 +583,14 @@ extern "C"
     // a single hop; nothing about this function changes for longer chains
     // or mixed directions -- that's what "naturally supports longer
     // chains" means here.
-    static json apply_traversal_chain(const json &sem, const json &items, const std::vector<TraversalStep> &chain)
+    static json apply_traversal_chain(const SemanticContext &ctx, const json &items, const std::vector<TraversalStep> &chain)
     {
         json current = items;
 
         for (const auto &step : chain)
             current = step.reverse
-                          ? traverse_results_reverse(sem, current, step.field)
-                          : traverse_results(sem, current, step.field);
+                          ? traverse_results_reverse(ctx, current, step.field)
+                          : traverse_results(ctx, current, step.field);
 
         return current;
     }
@@ -522,7 +614,7 @@ extern "C"
     // appended to `edges_out` regardless of whether its target was already
     // seen -- two different origins reaching the same target are two
     // distinct edges against one shared result object.
-    static json traverse_results_with_edges(const json &sem, const json &items, const TraversalStep &step, json &edges_out)
+    static json traverse_results_with_edges(const SemanticContext &ctx, const json &items, const TraversalStep &step, json &edges_out)
     {
         std::unordered_set<std::string> seen;
         json out = json::array();
@@ -533,7 +625,7 @@ extern "C"
 
             if (step.reverse)
             {
-                json matches = traverse_relationship_reverse(sem, item, step.field);
+                json matches = traverse_relationship_reverse(ctx, item, step.field);
 
                 for (const auto &match : matches)
                 {
@@ -548,7 +640,7 @@ extern "C"
             }
             else
             {
-                const json *related = traverse_relationship(sem, item, step.field);
+                const json *related = traverse_relationship(ctx, item, step.field);
                 if (!related)
                     continue;
 
@@ -570,14 +662,14 @@ extern "C"
     // that hop's relationship/direction plus the edges it followed. A
     // longer chain just means more entries here -- nothing about this
     // function's shape changes for additional hops.
-    static json apply_traversal_chain_with_paths(const json &sem, const json &items, const std::vector<TraversalStep> &chain, json &paths_out)
+    static json apply_traversal_chain_with_paths(const SemanticContext &ctx, const json &items, const std::vector<TraversalStep> &chain, json &paths_out)
     {
         json current = items;
 
         for (const auto &step : chain)
         {
             json edges = json::array();
-            current = traverse_results_with_edges(sem, current, step, edges);
+            current = traverse_results_with_edges(ctx, current, step, edges);
 
             paths_out.push_back({{"relationship", step.field},
                                   {"direction", step.reverse ? "reverse" : "forward"},
@@ -681,7 +773,7 @@ extern "C"
     // mirrors the tree shape so branches remain distinguishable in the
     // response -- edges plus a nested "then" for whatever this node
     // branched into, omitted for a leaf.
-    static void apply_traversal_node(const json &sem, const json &items, const TraversalNode &node,
+    static void apply_traversal_node(const SemanticContext &ctx, const json &items, const TraversalNode &node,
                                       json &union_out, std::unordered_set<std::string> &union_seen,
                                       json &path_node_out)
     {
@@ -695,7 +787,7 @@ extern "C"
 
             if (node.reverse)
             {
-                json matches = traverse_relationship_reverse(sem, item, node.field);
+                json matches = traverse_relationship_reverse(ctx, item, node.field);
 
                 for (const auto &match : matches)
                 {
@@ -708,7 +800,7 @@ extern "C"
             }
             else
             {
-                const json *related = traverse_relationship(sem, item, node.field);
+                const json *related = traverse_relationship(ctx, item, node.field);
                 if (!related)
                     continue;
 
@@ -741,7 +833,7 @@ extern "C"
         for (const auto &child : node.then)
         {
             json child_path = json::object();
-            apply_traversal_node(sem, hop_out, child, union_out, union_seen, child_path);
+            apply_traversal_node(ctx, hop_out, child, union_out, union_seen, child_path);
             children.push_back(child_path);
         }
 
@@ -751,7 +843,7 @@ extern "C"
     // Applies a forest of root nodes (each independent, from the same
     // starting items) and returns the union of every leaf across the whole
     // tree, plus the tree-shaped path description in `paths_out`.
-    static json apply_traversal_forest(const json &sem, const json &items, const std::vector<TraversalNode> &roots, json &paths_out)
+    static json apply_traversal_forest(const SemanticContext &ctx, const json &items, const std::vector<TraversalNode> &roots, json &paths_out)
     {
         json union_out = json::array();
         std::unordered_set<std::string> union_seen;
@@ -759,7 +851,7 @@ extern "C"
         for (const auto &root : roots)
         {
             json root_path = json::object();
-            apply_traversal_node(sem, items, root, union_out, union_seen, root_path);
+            apply_traversal_node(ctx, items, root, union_out, union_seen, root_path);
             paths_out.push_back(root_path);
         }
 
@@ -792,7 +884,7 @@ extern "C"
     // starting objects themselves are never included, only what's newly
     // reached from them, matching how "traverse"/"traverse_tree" already
     // never include the starting objects either.
-    static json apply_recursive_traversal(const json &sem, const json &items, const std::string &field, bool reverse, int64_t max_depth, json &paths_out)
+    static json apply_recursive_traversal(const SemanticContext &ctx, const json &items, const std::string &field, bool reverse, int64_t max_depth, json &paths_out)
     {
         // max_depth < 0 means "omitted" (see call site) -- an explicit 0
         // means zero hops, so the loop below runs zero times.
@@ -829,7 +921,7 @@ extern "C"
 
                 if (reverse)
                 {
-                    json matches = traverse_relationship_reverse(sem, item, field);
+                    json matches = traverse_relationship_reverse(ctx, item, field);
 
                     for (const auto &match : matches)
                     {
@@ -842,7 +934,7 @@ extern "C"
                 }
                 else
                 {
-                    const json *related = traverse_relationship(sem, item, field);
+                    const json *related = traverse_relationship(ctx, item, field);
                     if (!related)
                         continue;
 
@@ -1266,18 +1358,18 @@ extern "C"
     // in parameter_fallback_chain() below. Adding a new inheritance path
     // (family, host, ...) means writing one more step function and adding it
     // to that list -- nothing that resolves a field ever needs to change.
-    using FallbackStep = const json *(*)(const json &sem, const json &item);
+    using FallbackStep = const json *(*)(const SemanticContext &ctx, const json &item);
 
     // instance -> type: follows the instance's typeId to its type record
     // (the "types" bucket in semantic.json), reusing the existing generic
     // whole-tree uniqueId lookup already used by the traversal-chain feature.
-    static const json *fallback_via_type(const json &sem, const json &item)
+    static const json *fallback_via_type(const SemanticContext &ctx, const json &item)
     {
         // Same lookup as traverse_relationship's "typeId" case; this is the
         // one sanctioned use of that classification link (see
         // classification_link_fields()) -- parameter inheritance, not graph
         // traversal.
-        return traverse_relationship(sem, item, "typeId");
+        return traverse_relationship(ctx, item, "typeId");
     }
 
     static const std::vector<FallbackStep> &parameter_fallback_chain()
@@ -1299,7 +1391,7 @@ extern "C"
     // themselves are unchanged and are what actually gets called at every
     // hop, so there is exactly one implementation of "how a value is read
     // off one record."
-    static const json *resolve_with_fallback(const json &sem, const json &item, const std::string &field_or_path, FieldResolver base)
+    static const json *resolve_with_fallback(const SemanticContext &ctx, const json &item, const std::string &field_or_path, FieldResolver base)
     {
         const json *direct = base(item, field_or_path);
         if (direct)
@@ -1307,7 +1399,7 @@ extern "C"
 
         for (auto step : parameter_fallback_chain())
         {
-            const json *related = step(sem, item);
+            const json *related = step(ctx, item);
             if (!related)
                 continue;
 
@@ -1319,9 +1411,9 @@ extern "C"
         return nullptr;
     }
 
-    static const json *resolve_field_with_fallback(const json &sem, const json &item, const std::string &field)
+    static const json *resolve_field_with_fallback(const SemanticContext &ctx, const json &item, const std::string &field)
     {
-        return resolve_with_fallback(sem, item, field, resolve_field);
+        return resolve_with_fallback(ctx, item, field, resolve_field);
     }
 
     // Generic stringification used by eq/neq/contains. Works uniformly for
@@ -1428,7 +1520,7 @@ extern "C"
     // Evaluates a single {field, op, value} clause against one semantic
     // object. Dispatches purely on the "op" string; contains no field-name
     // or category-name branching.
-    static bool eval_filter_clause(const json &sem, const json &item, const json &clause)
+    static bool eval_filter_clause(const SemanticContext &ctx, const json &item, const json &clause)
     {
         if (!clause.is_object())
             return false;
@@ -1439,7 +1531,7 @@ extern "C"
         if (field.empty())
             return false;
 
-        const json *actual = resolve_field_with_fallback(sem, item, field);
+        const json *actual = resolve_field_with_fallback(ctx, item, field);
 
         if (op == "exists")
             return actual != nullptr && !actual->is_null();
@@ -1498,7 +1590,7 @@ extern "C"
     // Combines all clauses for one semantic object using a generic AND/OR
     // fold. "match" is "all" (AND, default) or "any" (OR); the fold itself
     // has no knowledge of what each clause checks.
-    static bool eval_filters(const json &sem, const json &item, const json &filters, const std::string &match)
+    static bool eval_filters(const SemanticContext &ctx, const json &item, const json &filters, const std::string &match)
     {
         if (!filters.is_array() || filters.empty())
             return true;
@@ -1507,7 +1599,7 @@ extern "C"
 
         for (const auto &clause : filters)
         {
-            bool clause_result = eval_filter_clause(sem, item, clause);
+            bool clause_result = eval_filter_clause(ctx, item, clause);
 
             if (require_all && !clause_result)
                 return false;
@@ -1526,12 +1618,12 @@ extern "C"
     // just produced; a future "filter -> traverse -> filter -> traverse ->
     // filter" pipeline would just call this (and apply_traversal_chain)
     // repeatedly in sequence -- neither needs to change for that.
-    static json apply_filters_stage(const json &sem, const json &items, const json &filters, const std::string &match)
+    static json apply_filters_stage(const SemanticContext &ctx, const json &items, const json &filters, const std::string &match)
     {
         json out = json::array();
 
         for (const auto &item : items)
-            if (eval_filters(sem, item, filters, match))
+            if (eval_filters(ctx, item, filters, match))
                 out.push_back(item);
 
         return out;
@@ -1586,9 +1678,9 @@ extern "C"
     // right after resolve_field), reused here for resolve_path so select/
     // distinct/group_by/sort see the identical instance -> type (-> ...)
     // inheritance that filtering does.
-    static const json *resolve_path_with_fallback(const json &sem, const json &item, const std::string &path)
+    static const json *resolve_path_with_fallback(const SemanticContext &ctx, const json &item, const std::string &path)
     {
-        return resolve_with_fallback(sem, item, path, resolve_path);
+        return resolve_with_fallback(ctx, item, path, resolve_path);
     }
 
     // Writes `value` into `out` at a (possibly dotted) path, creating
@@ -1641,13 +1733,13 @@ extern "C"
     // Projects one item down to just the requested paths, reconstructed with
     // their original nesting. Missing paths come back as null so the output
     // shape is predictable regardless of which items happen to have them.
-    static json project_fields(const json &sem, const json &item, const std::vector<std::string> &fields)
+    static json project_fields(const SemanticContext &ctx, const json &item, const std::vector<std::string> &fields)
     {
         json out = json::object();
 
         for (const auto &f : fields)
         {
-            const json *v = resolve_path_with_fallback(sem, item, f);
+            const json *v = resolve_path_with_fallback(ctx, item, f);
             set_path(out, f, v ? *v : json(nullptr));
         }
 
@@ -1682,7 +1774,7 @@ extern "C"
 
     // Sorts `arr` in place by `field` (a resolve_path path). Entries missing
     // the field always sort last, regardless of direction, for determinism.
-    static void sort_results(const json &sem, json &arr, const std::string &field, bool descending)
+    static void sort_results(const SemanticContext &ctx, json &arr, const std::string &field, bool descending)
     {
         if (!arr.is_array() || field.empty())
             return;
@@ -1691,8 +1783,8 @@ extern "C"
 
         std::stable_sort(items.begin(), items.end(), [&](const json &lhs, const json &rhs)
                           {
-            const json *lv = resolve_path_with_fallback(sem, lhs, field);
-            const json *rv = resolve_path_with_fallback(sem, rhs, field);
+            const json *lv = resolve_path_with_fallback(ctx, lhs, field);
+            const json *rv = resolve_path_with_fallback(ctx, rhs, field);
 
             bool l_missing = (!lv || lv->is_null());
             bool r_missing = (!rv || rv->is_null());
@@ -1714,7 +1806,7 @@ extern "C"
 
     // group_by: collapses `items` into one {"value","count"} entry per
     // distinct value of `field`, in first-seen order.
-    static json group_by_results(const json &sem, const json &items, const std::string &field)
+    static json group_by_results(const SemanticContext &ctx, const json &items, const std::string &field)
     {
         std::vector<std::string> order;
         std::unordered_map<std::string, int> counts;
@@ -1722,7 +1814,7 @@ extern "C"
 
         for (const auto &item : items)
         {
-            const json *v = resolve_path_with_fallback(sem, item, field);
+            const json *v = resolve_path_with_fallback(ctx, item, field);
             json key_value = v ? *v : json(nullptr);
             std::string key = json_to_compare_string(key_value);
 
@@ -1744,7 +1836,7 @@ extern "C"
 
     // distinct: collapses `items` into one entry per unique combination of
     // `fields`, in first-seen order, shaped like select's output.
-    static json distinct_results(const json &sem, const json &items, const std::vector<std::string> &fields)
+    static json distinct_results(const SemanticContext &ctx, const json &items, const std::vector<std::string> &fields)
     {
         std::unordered_map<std::string, bool> seen;
         json out = json::array();
@@ -1754,7 +1846,7 @@ extern "C"
             std::string key;
             for (const auto &f : fields)
             {
-                const json *v = resolve_path_with_fallback(sem, item, f);
+                const json *v = resolve_path_with_fallback(ctx, item, f);
                 key += json_to_compare_string(v ? *v : json(nullptr));
                 key += '\x1f';
             }
@@ -1763,7 +1855,7 @@ extern "C"
                 continue;
 
             seen[key] = true;
-            out.push_back(project_fields(sem, item, fields));
+            out.push_back(project_fields(ctx, item, fields));
         }
 
         return out;
@@ -1771,12 +1863,12 @@ extern "C"
 
     // select: projects every item down to just `fields`, one output entry
     // per matched item (not deduplicated).
-    static json select_results(const json &sem, const json &items, const std::vector<std::string> &fields)
+    static json select_results(const SemanticContext &ctx, const json &items, const std::vector<std::string> &fields)
     {
         json out = json::array();
 
         for (const auto &item : items)
-            out.push_back(project_fields(sem, item, fields));
+            out.push_back(project_fields(ctx, item, fields));
 
         return out;
     }
@@ -1839,12 +1931,12 @@ extern "C"
     // fans out (a reverse hop reaching several nodes) makes this item
     // contribute to every reached node's group, the same fan-out reverse
     // traversal already has elsewhere.
-    static json graph_group_identities(const json &sem, const json &item, const std::vector<TraversalStep> &chain)
+    static json graph_group_identities(const SemanticContext &ctx, const json &item, const std::vector<TraversalStep> &chain)
     {
         json single = json::array();
         single.push_back(item);
 
-        json reached = apply_traversal_chain(sem, single, chain);
+        json reached = apply_traversal_chain(ctx, single, chain);
 
         json identities = json::array();
 
@@ -1882,7 +1974,7 @@ extern "C"
     // own attributes via resolve_path_with_fallback and json_value_to_number
     // -- the same field resolution and numeric coercion used everywhere
     // else in this engine, not reimplemented here.
-    static json aggregate_results(const json &sem, const json &items, bool has_group, bool group_is_graph,
+    static json aggregate_results(const SemanticContext &ctx, const json &items, bool has_group, bool group_is_graph,
                                    const std::string &group_field, const std::vector<TraversalStep> &group_chain,
                                    const std::vector<AggregateMetric> &metrics)
     {
@@ -1916,7 +2008,7 @@ extern "C"
                 if (m.function == "count")
                     continue;
 
-                const json *v = resolve_path_with_fallback(sem, item, m.field);
+                const json *v = resolve_path_with_fallback(ctx, item, m.field);
                 double num;
                 if (!v || !json_value_to_number(*v, num))
                     continue;
@@ -1948,7 +2040,7 @@ extern "C"
 
             if (group_is_graph)
             {
-                json identities = graph_group_identities(sem, item, group_chain);
+                json identities = graph_group_identities(ctx, item, group_chain);
 
                 for (const auto &identity : identities)
                 {
@@ -1959,7 +2051,7 @@ extern "C"
                 continue;
             }
 
-            const json *v = resolve_path_with_fallback(sem, item, group_field);
+            const json *v = resolve_path_with_fallback(ctx, item, group_field);
             json group_value = v ? *v : json(nullptr);
             std::string key = json_to_compare_string(group_value);
             accumulate(ensure_group(key, group_value), item);
@@ -2101,16 +2193,16 @@ extern "C"
         return "";
     }
 
-    static bool evaluate_graph_constraint(const json &sem, const json &item, const Constraint &c)
+    static bool evaluate_graph_constraint(const SemanticContext &ctx, const json &item, const Constraint &c)
     {
         json single = json::array();
         single.push_back(item);
 
         json unused_paths = json::array();
-        json reached = apply_traversal_forest(sem, single, c.tree, unused_paths);
+        json reached = apply_traversal_forest(ctx, single, c.tree, unused_paths);
 
         if (!c.where_filters.empty())
-            reached = apply_filters_stage(sem, reached, c.where_filters, "all");
+            reached = apply_filters_stage(ctx, reached, c.where_filters, "all");
 
         double count = static_cast<double>(reached.size());
 
@@ -2138,7 +2230,7 @@ extern "C"
     // of each item (nothing removed, nothing reshaped) with an added
     // "constraints" object mapping each constraint's name to its pass/fail
     // verdict for that item.
-    static json evaluate_constraints(const json &sem, const json &items, const std::vector<Constraint> &constraints)
+    static json evaluate_constraints(const SemanticContext &ctx, const json &items, const std::vector<Constraint> &constraints)
     {
         json out = json::array();
 
@@ -2150,8 +2242,8 @@ extern "C"
             for (const auto &c : constraints)
             {
                 bool pass = c.is_graph
-                                ? evaluate_graph_constraint(sem, item, c)
-                                : eval_filter_clause(sem, item, c.field_clause);
+                                ? evaluate_graph_constraint(ctx, item, c)
+                                : eval_filter_clause(ctx, item, c.field_clause);
                 verdicts[c.name] = pass;
             }
 
@@ -2175,7 +2267,7 @@ extern "C"
     // used to live inline in handle_action_semantic_filter; behavior is
     // unchanged for that caller, just relocated so a second caller can
     // reuse it without duplicating the shape/sort/limit dispatch.
-    static json apply_post_processing_and_respond(const json &sem, const json &results, const json &req, json base_response)
+    static json apply_post_processing_and_respond(const SemanticContext &ctx, const json &results, const json &req, json base_response)
     {
         bool has_group_by = req.contains("group_by") && req["group_by"].is_string() && !req["group_by"].get<std::string>().empty();
         bool has_distinct = req.contains("distinct") && !to_field_list(req["distinct"]).empty();
@@ -2190,11 +2282,11 @@ extern "C"
         json shaped = results;
 
         if (has_group_by)
-            shaped = group_by_results(sem, results, req["group_by"].get<std::string>());
+            shaped = group_by_results(ctx, results, req["group_by"].get<std::string>());
         else if (has_distinct)
-            shaped = distinct_results(sem, results, to_field_list(req["distinct"]));
+            shaped = distinct_results(ctx, results, to_field_list(req["distinct"]));
         else if (has_select)
-            shaped = select_results(sem, results, to_field_list(req["select"]));
+            shaped = select_results(ctx, results, to_field_list(req["select"]));
         else if (has_aggregate)
         {
             const json &agg = req["aggregate"];
@@ -2210,7 +2302,7 @@ extern "C"
                 {
                     agg_group_chain = to_traversal_steps(agg["group_by"]["relationship"]);
 
-                    std::string chain_error = validate_traversal_steps(sem, agg_group_chain);
+                    std::string chain_error = validate_traversal_steps(ctx.tree, agg_group_chain);
                     if (!chain_error.empty())
                         return json({{"error", chain_error}});
                 }
@@ -2232,17 +2324,17 @@ extern "C"
                     return json({{"error", "Unknown aggregate function: \"" + m.function + "\""}});
             }
 
-            shaped = aggregate_results(sem, results, agg_has_group, agg_group_is_graph, agg_group_field, agg_group_chain, metrics);
+            shaped = aggregate_results(ctx, results, agg_has_group, agg_group_is_graph, agg_group_field, agg_group_chain, metrics);
         }
         else if (has_constraints)
         {
             std::vector<Constraint> constraints = parse_constraints(req["constraints"]);
 
-            std::string constraint_error = validate_constraints(sem, constraints);
+            std::string constraint_error = validate_constraints(ctx.tree, constraints);
             if (!constraint_error.empty())
                 return json({{"error", constraint_error}});
 
-            shaped = evaluate_constraints(sem, results, constraints);
+            shaped = evaluate_constraints(ctx, results, constraints);
         }
 
         bool has_sort = req.contains("sort") && req["sort"].is_object();
@@ -2250,7 +2342,7 @@ extern "C"
         {
             std::string sort_field = req["sort"].value("field", "");
             std::string sort_order = req["sort"].value("order", "asc");
-            sort_results(sem, shaped, sort_field, sort_order == "desc");
+            sort_results(ctx, shaped, sort_field, sort_order == "desc");
         }
 
         size_t shaped_count = shaped.size();
@@ -2299,7 +2391,7 @@ extern "C"
     // actually runs; handle_action_semantic_filter (below) and Step 8's set-
     // query leaves both call it directly, in-process -- leaves never
     // serialize to a string or re-enter the action dispatcher.
-    static json execute_semantic_filter_query(const json &sem, const json &req)
+    static json execute_semantic_filter_query(const SemanticContext &ctx, const json &req)
     {
         json filters = (req.contains("filters") && req["filters"].is_array())
                            ? req["filters"]
@@ -2311,9 +2403,9 @@ extern "C"
 
         // Generic walk: every top-level bucket, every item inside its
         // "items" array, regardless of bucket name or item category.
-        if (sem.is_object())
+        if (ctx.tree.is_object())
         {
-            for (const auto &bucket_entry : sem.items())
+            for (const auto &bucket_entry : ctx.tree.items())
             {
                 const json &bucket = bucket_entry.value();
 
@@ -2325,7 +2417,7 @@ extern "C"
                     if (!item.is_object())
                         continue;
 
-                    if (eval_filters(sem, item, filters, match))
+                    if (eval_filters(ctx, item, filters, match))
                         results.push_back(item);
                 }
             }
@@ -2344,23 +2436,23 @@ extern "C"
 
         if (has_traverse)
         {
-            std::string chain_error = validate_traversal_steps(sem, traverse_chain);
+            std::string chain_error = validate_traversal_steps(ctx.tree, traverse_chain);
             if (!chain_error.empty())
                 return json({{"error", chain_error}});
 
             results = include_paths
-                          ? apply_traversal_chain_with_paths(sem, results, traverse_chain, paths)
-                          : apply_traversal_chain(sem, results, traverse_chain);
+                          ? apply_traversal_chain_with_paths(ctx, results, traverse_chain, paths)
+                          : apply_traversal_chain(ctx, results, traverse_chain);
         }
         else if (has_traverse_tree)
         {
             std::vector<TraversalNode> forest = parse_traversal_forest(req["traverse_tree"]);
 
-            std::string tree_error = validate_traversal_forest(sem, forest);
+            std::string tree_error = validate_traversal_forest(ctx.tree, forest);
             if (!tree_error.empty())
                 return json({{"error", tree_error}});
 
-            results = apply_traversal_forest(sem, results, forest, paths);
+            results = apply_traversal_forest(ctx, results, forest, paths);
         }
         else if (has_traverse_recursive)
         {
@@ -2386,11 +2478,11 @@ extern "C"
             }
 
             std::vector<TraversalStep> single_step = {{field, reverse}};
-            std::string rel_error = validate_traversal_steps(sem, single_step);
+            std::string rel_error = validate_traversal_steps(ctx.tree, single_step);
             if (!rel_error.empty())
                 return json({{"error", rel_error}});
 
-            results = apply_recursive_traversal(sem, results, field, reverse, max_depth, paths);
+            results = apply_recursive_traversal(ctx, results, field, reverse, max_depth, paths);
         }
 
         json filters_after_traverse = (req.contains("filters_after_traverse") && req["filters_after_traverse"].is_array())
@@ -2399,7 +2491,7 @@ extern "C"
         bool has_filters_after_traverse = !filters_after_traverse.empty();
 
         if (has_filters_after_traverse)
-            results = apply_filters_stage(sem, results, filters_after_traverse, "all");
+            results = apply_filters_stage(ctx, results, filters_after_traverse, "all");
 
         json base = {{"plugin", "AIQuery"},
                      {"status", "ok"},
@@ -2418,7 +2510,7 @@ extern "C"
         if (has_filters_after_traverse)
             base["filters_after_traverse"] = filters_after_traverse;
 
-        return apply_post_processing_and_respond(sem, results, req, base);
+        return apply_post_processing_and_respond(ctx, results, req, base);
     }
 
     static bool handle_action_semantic_filter(const json &req, const std::string &model, std::string &response)
@@ -2438,7 +2530,11 @@ extern "C"
             return true;
         }
 
-        response = execute_semantic_filter_query(sem, req).dump();
+        std::unordered_map<std::string, const json *> id_index = build_unique_id_index(sem);
+        std::unordered_map<std::string, std::unordered_map<std::string, std::vector<const json *>>> reverse_index_cache;
+        SemanticContext ctx{sem, id_index, reverse_index_cache};
+
+        response = execute_semantic_filter_query(ctx, req).dump();
         return true;
     }
 
@@ -2633,7 +2729,7 @@ extern "C"
     // pruning against the FINAL survivor set once the whole tree resolves
     // (handle_action_set_query does the pruning, not this function, since
     // "final" only means anything once every operand has run).
-    static json execute_set_operand(const json &sem, const json &node, bool force_include_paths, json &leaf_paths_out, int &next_leaf_index)
+    static json execute_set_operand(const SemanticContext &ctx, const json &node, bool force_include_paths, json &leaf_paths_out, int &next_leaf_index)
     {
         bool is_set_op = node.is_object() && node.contains("operation") &&
                          (node["operation"] == "union" || node["operation"] == "intersect" || node["operation"] == "difference");
@@ -2648,7 +2744,7 @@ extern "C"
             std::vector<json> operand_sets;
             for (const auto &child : node["operands"])
             {
-                json result = execute_set_operand(sem, child, force_include_paths, leaf_paths_out, next_leaf_index);
+                json result = execute_set_operand(ctx, child, force_include_paths, leaf_paths_out, next_leaf_index);
                 if (result.is_object() && result.contains("error"))
                     return result;
                 operand_sets.push_back(result);
@@ -2667,7 +2763,7 @@ extern "C"
         if (force_include_paths)
             leaf_req["include_paths"] = true;
 
-        json leaf_response = execute_semantic_filter_query(sem, leaf_req);
+        json leaf_response = execute_semantic_filter_query(ctx, leaf_req);
 
         if (leaf_response.contains("error"))
             return leaf_response;
@@ -2716,11 +2812,15 @@ extern "C"
             return true;
         }
 
+        std::unordered_map<std::string, const json *> id_index = build_unique_id_index(sem);
+        std::unordered_map<std::string, std::unordered_map<std::string, std::vector<const json *>>> reverse_index_cache;
+        SemanticContext ctx{sem, id_index, reverse_index_cache};
+
         bool include_paths = req.value("include_paths", false);
         json leaf_paths = json::array();
         int next_leaf_index = 0;
 
-        json combined = execute_set_operand(sem, req["expression"], include_paths, leaf_paths, next_leaf_index);
+        json combined = execute_set_operand(ctx, req["expression"], include_paths, leaf_paths, next_leaf_index);
 
         if (combined.is_object() && combined.contains("error"))
         {
@@ -2747,7 +2847,7 @@ extern "C"
             base["paths"] = leaf_paths;
         }
 
-        response = apply_post_processing_and_respond(sem, combined, req, base).dump();
+        response = apply_post_processing_and_respond(ctx, combined, req, base).dump();
         return true;
     }
 
@@ -2951,9 +3051,13 @@ extern "C"
 
         dbg("GET_ELEMENT sem_load:", sem_loaded ? "true" : "false");
 
+        std::unordered_map<std::string, const json *> id_index = build_unique_id_index(sem);
+        std::unordered_map<std::string, std::unordered_map<std::string, std::vector<const json *>>> reverse_index_cache;
+        SemanticContext ctx{sem, id_index, reverse_index_cache};
+
         if (sem_loaded && !semantic_unique_id.empty())
         {
-            const json *found_elem = find_semantic_by_unique_id(sem, semantic_unique_id);
+            const json *found_elem = find_semantic_by_unique_id(ctx, semantic_unique_id);
 
             if (found_elem)
             {
@@ -2965,7 +3069,7 @@ extern "C"
 
                 for (int depth = 0; depth < 32; ++depth)
                 {
-                    const json *next = find_next_semantic_context(sem, resolved_element);
+                    const json *next = find_next_semantic_context(ctx, resolved_element);
                     if (!next)
                         break;
 
@@ -3047,9 +3151,14 @@ extern "C"
         }
 
         json sem;
-        if (load_json_mmap(sem_path, sem) && !semantic_unique_id.empty())
+        bool sem_loaded = load_json_mmap(sem_path, sem);
+        std::unordered_map<std::string, const json *> id_index = build_unique_id_index(sem);
+        std::unordered_map<std::string, std::unordered_map<std::string, std::vector<const json *>>> reverse_index_cache;
+        SemanticContext ctx{sem, id_index, reverse_index_cache};
+
+        if (sem_loaded && !semantic_unique_id.empty())
         {
-            const json *found_elem = find_semantic_by_unique_id(sem, semantic_unique_id);
+            const json *found_elem = find_semantic_by_unique_id(ctx, semantic_unique_id);
 
             if (found_elem)
             {
