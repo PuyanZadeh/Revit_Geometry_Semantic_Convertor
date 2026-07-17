@@ -6,6 +6,8 @@
 #include <boost/asio/ip/tcp.hpp>
 
 #include <dlfcn.h>
+#include <sys/stat.h>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <thread>
@@ -232,6 +234,11 @@ void handle_request(tcp::socket socket) {
         const auto version = parser.get().version();
         const std::string raw_target = std::string(parser.get().target());
 
+        // TEMP-DEBUG(trace-chain): full execution-path trace, requested to
+        // pin down exactly where a request stops matching expectations.
+        // Remove once the loading/routing question is settled.
+        dbg("TRACE endpoint received raw_target:", raw_target);
+
         if (method == http::verb::options) {
             http::response<http::empty_body> res{http::status::ok, version};
             add_cors(res);
@@ -270,6 +277,11 @@ void handle_request(tcp::socket socket) {
         std::string handler_name = "handle_ifc_" + target;
         std::string so_path = std::string(kSoDir) + "/libifc_" + target + "_plugin.so";
 
+        // TEMP-DEBUG(trace-chain): see note above.
+        dbg("TRACE routed target:", target);
+        dbg("TRACE resolved so_path:", so_path);
+        dbg("TRACE resolved handler_name:", handler_name);
+
         // TODO(infra): a long-running server process eventually stops picking up
         // rebuilt plugin .so's -- /proc/<pid>/maps shows a stale mapping to a
         // deleted inode, implying a leaked dlopen handle somewhere on this path
@@ -278,6 +290,8 @@ void handle_request(tcp::socket socket) {
         // until after Step 2-6 semantic-engine validation is stable.
         void* handle = dlopen(so_path.c_str(), RTLD_LAZY);
         if (!handle) {
+            // TEMP-DEBUG(trace-chain): see note above.
+            dbg("TRACE dlopen FAILED for so_path:", so_path);
             http::response<http::string_body> res{http::status::not_found, version};
             add_cors(res);
             res.set(http::field::content_type, "application/json");
@@ -288,9 +302,30 @@ void handle_request(tcp::socket socket) {
             return;
         }
 
+        // TEMP-DEBUG(trace-chain): the handle's pointer value and the file's
+        // on-disk mtime right now -- if the same handle address keeps
+        // recurring across requests made after a rebuild, that's direct
+        // evidence dlopen is reusing an already-mapped (possibly stale)
+        // library instead of the current file on disk (matches the
+        // known leaked-handle TODO above).
+        {
+            char handle_addr[32];
+            std::snprintf(handle_addr, sizeof(handle_addr), "%p", handle);
+            dbg("TRACE dlopen OK, handle:", handle_addr);
+
+            struct stat so_stat{};
+            if (stat(so_path.c_str(), &so_stat) == 0) {
+                dbg("TRACE so_path on-disk mtime (epoch):", std::to_string(so_stat.st_mtime));
+            } else {
+                dbg("TRACE so_path stat() failed (file missing on disk right now?)");
+            }
+        }
+
         using func_t = const char* (*)(const std::string&);
         auto func = (func_t)dlsym(handle, handler_name.c_str());
         if (!func) {
+            // TEMP-DEBUG(trace-chain): see note above.
+            dbg("TRACE dlsym FAILED for handler_name:", handler_name);
             dlclose(handle);
             http::response<http::string_body> res{http::status::not_found, version};
             add_cors(res);
@@ -301,6 +336,8 @@ void handle_request(tcp::socket socket) {
             socket.shutdown(tcp::socket::shutdown_send);
             return;
         }
+        // TEMP-DEBUG(trace-chain): see note above.
+        dbg("TRACE dlsym OK, about to call:", handler_name);
 
         // If this is a multipart upload (ConvertPanel), stream IFC to disk and pass JSON path to plugin.
         std::string content_type = get_header_value(parser.get().base(), "Content-Type");
@@ -360,7 +397,16 @@ void handle_request(tcp::socket socket) {
             plugin_input = body;
         }
 
+        // TEMP-DEBUG(trace-chain): the exact raw bytes handed to the
+        // plugin's dispatcher, verbatim -- this is the ground truth of
+        // what actually arrived, independent of what the browser/panel
+        // was intended to send.
+        dbg("TRACE plugin_input body:", plugin_input);
+
         const char* output = func(plugin_input);
+
+        // TEMP-DEBUG(trace-chain): see note above.
+        dbg("TRACE dispatcher output:", output ? output : "(null)");
 
         http::response<http::string_body> res{http::status::ok, version};
         add_cors(res);

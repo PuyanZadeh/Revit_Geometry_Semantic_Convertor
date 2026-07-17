@@ -33,16 +33,43 @@ export default function AIQueryPanel() {
     setResult(JSON.stringify(res.data, null, 2));
   } */
  async function runQuery() {
-  if (!selected || !query) return;
+  if (!query) return;
 
-  const req = {
-    action: "nl_query",
-    model: selected,
-    nl: query
-  };
+  let payload: any;
+  try {
+    payload = JSON.parse(query);
+  } catch {
+    payload = undefined;
+  }
 
-  const res = await api.post("/aiquery", req);
-  setResult(JSON.stringify(res.data, null, 2));
+  if (payload !== undefined && typeof payload === "object" && payload !== null && !Array.isArray(payload)) {
+    // Raw JSON mode -- sent to /aiquery exactly as written, same convention
+    // GeomPanel.tsx uses for /geom. Only fills in `model` when the JSON
+    // doesn't already specify one; never overrides an explicit value.
+    if (payload.model === undefined && selected) {
+      payload.model = selected;
+    }
+  } else {
+    // Not valid JSON (or not a plain object) -- existing natural-language
+    // workflow, unchanged.
+    if (!selected) return;
+    payload = {
+      action: "nl_query",
+      model: selected,
+      nl: query
+    };
+  }
+
+  try {
+    const res = await api.post("/aiquery", payload);
+    setResult(JSON.stringify(res.data, null, 2));
+  } catch (e: any) {
+    if (e?.response?.data !== undefined) {
+      setResult(JSON.stringify(e.response.data, null, 2));
+    } else {
+      setResult("Request failed: " + (e?.message || String(e)));
+    }
+  }
 }
 
 
@@ -73,7 +100,7 @@ export default function AIQueryPanel() {
       <textarea
         style={{ width: "100%", height: "80px", marginBottom: "10px" }}        
         // placeholder="Enter GlobalId"
-        placeholder="Enter natural language query (e.g. count all windows)"
+        placeholder='Enter a natural language query (e.g. count all windows), or paste raw request JSON (e.g. {"action": "get_parameters", "elementId": "751237", "parameters": ["Area"]}) to send it to /aiquery unchanged'
 
         value={query}
         onChange={(e) => setQuery(e.target.value)}

@@ -3184,15 +3184,156 @@ extern "C"
         return true;
     }
 
+    // ------------------------------------------------------------------
+    // get_parameters: additive action, new for this plugin. No existing
+    // action in this file resolves an element by Revit intId -- get_element
+    // and validate_id resolve via globalId/nodeIndex through map.json, and
+    // find_semantic_by_unique_id only ever looks up by uniqueId. This is an
+    // independent intId->uniqueId resolver for get_parameters specifically,
+    // conceptually mirroring ifc_geom.cpp's RevitIdResolver but not sharing
+    // code with it (no cross-plugin sharing, consistent with this codebase's
+    // existing convention).
+    // ------------------------------------------------------------------
+
+    // Linear scan is acceptable here -- unlike build_unique_id_index (the
+    // hot path for every forward/reverse traversal hop), this only runs at
+    // most once per get_parameters request, and only when the submitted id
+    // missed the direct uniqueId lookup and is purely numeric.
+    static std::string resolve_int_id_to_unique_id(const json &sem, int64_t revit_id)
+    {
+        std::string resolved;
+
+        for_each_semantic_item(sem, [&](const json &item)
+                                {
+            if (!resolved.empty())
+                return;
+            if (!item.contains("intId") || !item["intId"].is_number_integer())
+                return;
+            if (item["intId"].get<int64_t>() != revit_id)
+                return;
+
+            std::string id = item.value("uniqueId", "");
+            if (!id.empty())
+                resolved = id; });
+
+        return resolved;
+    }
+
+    static bool handle_action_get_parameters(const json &req, const std::string &model, std::string &response)
+    {
+        std::string action = req.value("action", "");
+        if (action != "get_parameters")
+            return false;
+
+        std::string submitted_id = req.value("elementId", "");
+
+        // "parameters" is always an array, even for a single value -- one
+        // input shape, no singular/plural branching. Returned as an array
+        // (never a plain JSON object), since nlohmann::json's default
+        // object type is key-sorted (std::map-backed), not
+        // insertion-ordered, and preserving requested order is the point.
+        std::vector<std::string> parameters;
+        if (req.contains("parameters") && req["parameters"].is_array())
+        {
+            for (const auto &p : req["parameters"])
+                if (p.is_string())
+                    parameters.push_back(p.get<std::string>());
+        }
+
+        if (submitted_id.empty() || parameters.empty())
+        {
+            response = R"({"error":"missing elementId or parameters"})";
+            return true;
+        }
+
+        std::string sem_path = resolve_semantic_path_from_model(model);
+        json sem;
+        bool sem_loaded = load_json_mmap(sem_path, sem);
+
+        std::unordered_map<std::string, const json *> id_index = build_unique_id_index(sem);
+        std::unordered_map<std::string, std::unordered_map<std::string, std::vector<const json *>>> reverse_index_cache;
+        SemanticContext ctx{sem, id_index, reverse_index_cache};
+
+        const json *found_elem = nullptr;
+
+        if (sem_loaded)
+        {
+            // Bundle-authoritative order: tried directly as a uniqueId
+            // first, exactly as every other lookup in this file behaves.
+            // Only on failure, and only if the submitted string is purely
+            // numeric, is it retried via the Revit intId path.
+            found_elem = find_semantic_by_unique_id(ctx, submitted_id);
+
+            if (!found_elem)
+            {
+                int64_t revit_id;
+                if (parse_int64(submitted_id, revit_id))
+                {
+                    std::string resolved_id = resolve_int_id_to_unique_id(sem, revit_id);
+                    if (!resolved_id.empty())
+                        found_elem = find_semantic_by_unique_id(ctx, resolved_id);
+                }
+            }
+        }
+
+        if (!found_elem)
+        {
+            response = json({{"error", "element not found"}, {"elementId", submitted_id}}).dump();
+            return true;
+        }
+
+        const json &elem_params = (found_elem->contains("parameters") && (*found_elem)["parameters"].is_object())
+                                       ? (*found_elem)["parameters"]
+                                       : json::object();
+
+        // One entry per requested parameter, in the exact order requested --
+        // a per-parameter miss doesn't fail the whole request, matching this
+        // codebase's existing convention for batch lookups (see
+        // calculate_surface_area in ifc_geom.cpp).
+        //
+        // A requested name is tried first against the element's top-level
+        // semantic fields (levelId, typeId, hostId, parentId, uniqueId,
+        // intId, category -- i.e. every top-level key except "parameters"
+        // itself), then against the "parameters" object -- reusing exactly
+        // the fields the bundle already exposes, not a separate hardcoded
+        // allowlist that could drift out of sync with the schema.
+        json values = json::array();
+        for (const auto &p : parameters)
+        {
+            json entry;
+            entry["parameter"] = p;
+            if (p != "parameters" && found_elem->contains(p))
+                entry["value"] = (*found_elem)[p];
+            else if (elem_params.contains(p))
+                entry["value"] = elem_params[p];
+            else
+                entry["error"] = "parameter not found";
+            values.push_back(entry);
+        }
+
+        response = json({{"values", values}}).dump();
+
+        return true;
+    }
+
     const char *handle_ifc_aiquery(const std::string &input_json)
     {
         static std::string response;
+
+        // TEMP-DEBUG(trace-chain): proves this exact source file/function is
+        // the dispatcher executing, and shows the raw body it received --
+        // independent of main.cpp's own trace of the same body one layer up.
+        // Remove once the loading/routing question is settled.
+        dbg("TRACE handle_ifc_aiquery (aiquery.cpp) received input_json:", input_json);
 
         try
         {
             json req = json::parse(input_json);
             std::string action = req.value("action", "");
             std::string model = req.value("model", "");
+
+            dbg("TRACE parsed action:", action);
+            dbg("TRACE parsed model:", model);
 
             if (handle_action_nl_query(req, model, response))
                 return response.c_str();
@@ -3224,12 +3365,36 @@ extern "C"
             if (handle_action_validate_id(req, model, response))
                 return response.c_str();
 
+            dbg("TRACE about to try handle_action_get_parameters, action is:", action);
+            if (handle_action_get_parameters(req, model, response))
+            {
+                dbg("TRACE handle_action_get_parameters MATCHED, response:", response);
+                return response.c_str();
+            }
+            dbg("TRACE handle_action_get_parameters did NOT match (action != \"get_parameters\")");
+
+            // TEMP-DEBUG(ping-test): proves whether a rebuilt aiquery.so is
+            // actually being loaded, independent of get_parameters's own
+            // logic. Remove once the loading question is settled.
+            if (action == "ping_test")
+            {
+                response = R"({"status":"ok","message":"ping_test reached"})";
+                return response.c_str();
+            }
+
+            dbg("TRACE no handler matched action, falling to idle:", action);
             response = json({{"plugin", "AIQuery"},
                              {"status", "idle"}})
                            .dump();
         }
+        catch (const std::exception &e)
+        {
+            dbg("TRACE EXCEPTION during dispatch:", e.what());
+            response = R"({"error":"invalid input or runtime error"})";
+        }
         catch (...)
         {
+            dbg("TRACE UNKNOWN EXCEPTION during dispatch");
             response = R"({"error":"invalid input or runtime error"})";
         }
 

@@ -14,9 +14,13 @@ import "./ViewerPanel.css";
 export default function ViewerPanel({
   selectedModel,
   onSelectModel,
+  selectedElementId,
+  onSelectElement,
 }: {
   selectedModel: string;
   onSelectModel: (file: string) => void;
+  selectedElementId: string;
+  onSelectElement: (id: string) => void;
 }) {
   const [files, setFiles] = useState<string[]>([]);
   const selected = selectedModel;
@@ -31,7 +35,6 @@ export default function ViewerPanel({
   const modelRef = useRef<THREE.Object3D | null>(null);
   const fitRef = useRef<{ center: THREE.Vector3; distance: number } | null>(null);
 
-  const [pickedId, setPickedId] = useState<string>("");
   const [aiq, setAiq] = useState<any>(null);
 
   const assocRef = useRef<Map<any, any> | null>(null);
@@ -349,7 +352,7 @@ export default function ViewerPanel({
 
     let nodeIndex: number | null = interaction.nodeIndex;
     if (nodeIndex == null) {
-      setPickedId("");
+      onSelectElement("");
       console.log("Picked: no node association found");
       return;
     }
@@ -440,8 +443,7 @@ console.log("model path:", `http://192.168.0.150/storage/outputs/gltf/${encodeUR
     // }
     let intId: number | undefined = info.intId;
 
-    setPickedId(String(revitID ?? ""));
-    //setPickedId(String(intId ?? ""));
+    onSelectElement(String(revitID ?? ""));
 
     console.log("Picked node:", nodeIndex, "revitID:", revitID, "revitIntID:", intId, "globalId:", globalId);
   }
@@ -583,7 +585,7 @@ console.log("model path:", `http://192.168.0.150/storage/outputs/gltf/${encodeUR
           <div ref={containerRef} onClick={pickRevitId} className="vp-canvas" />
         </div>
         <div className="vp-inspector-col">
-          <SemanticInspector aiq={aiq} pickedId={pickedId} aiqErr={aiqErr} />
+          <SemanticInspector aiq={aiq} pickedId={selectedElementId} aiqErr={aiqErr} />
         </div>
       </div>
     </div>

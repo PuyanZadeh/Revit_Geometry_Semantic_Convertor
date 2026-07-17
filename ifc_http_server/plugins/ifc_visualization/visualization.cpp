@@ -78,20 +78,7 @@ const char* handle_ifc_visualization(const std::string& input_json) {
             return response.c_str();
         }
 
-        std::string scene_model = req.value("model", "default.ifc");
-
-        json scene = {
-            {"model", scene_model},
-            {"view", {
-                {"camera", {{"position", {0, 5, 10}}, {"target", {0, 0, 0}}}},
-                {"objects", {
-                    {{"id", 1}, {"type", "IfcWall"}, {"color", "#ffaa00"}, {"geometry", "cube"}},
-                    {{"id", 2}, {"type", "IfcDoor"}, {"color", "#4444ff"}, {"geometry", "rect"}}
-                }}
-            }}
-        };
-
-        response = scene.dump();
+        response = R"({"error":"unknown action"})";
     }
     catch (...) {
         response = R"({"error":"invalid input"})";

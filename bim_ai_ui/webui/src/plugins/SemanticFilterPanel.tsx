@@ -31,28 +31,43 @@ export default function SemanticFilterPanel({ selectedModel }: { selectedModel: 
     setRequestError("");
     setResponse(null);
 
-    if (!selectedModel) {
-      setRequestError("Please choose a model in the Viewer above.");
-      return;
-    }
-
-    const model = selectedModel.replace(/\.glb$/i, ".map.json");
+    const model = selectedModel ? selectedModel.replace(/\.glb$/i, ".map.json") : undefined;
     let req: any;
 
     if (mode === "json") {
       if (!jsonText.trim()) {
-        setRequestError("Please enter a query JSON.");
+        setRequestError("Please enter a request JSON.");
         return;
       }
-      let ast: any;
+
+      let parsed: any;
       try {
-        ast = JSON.parse(jsonText);
-      } catch (e) {
-        setRequestError("Invalid JSON.");
+        parsed = JSON.parse(jsonText);
+      } catch (e: any) {
+        setRequestError("Invalid JSON: " + (e?.message || String(e)));
         return;
       }
-      req = { action: "structured_query", model, ast };
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        setRequestError("Request JSON must be an object.");
+        return;
+      }
+
+      // True raw-request mode -- sent to /aiquery exactly as written, same
+      // convention GeomPanel.tsx uses for /geom: no action wrapping, no AST
+      // translation, no other modification. `model` is optional -- filled
+      // in from the picker above only when the JSON doesn't already
+      // specify one, and only if a model is actually selected; never
+      // required, never overridden.
+      req = parsed;
+      if (req.model === undefined && model) {
+        req.model = model;
+      }
     } else {
+      // Natural Language mode -- untouched, exactly as before.
+      if (!selectedModel) {
+        setRequestError("Please choose a model in the Viewer above.");
+        return;
+      }
       if (!query.trim()) {
         setRequestError("Please enter a query.");
         return;
@@ -120,10 +135,10 @@ export default function SemanticFilterPanel({ selectedModel }: { selectedModel: 
         </div>
       ) : (
         <div className="sfp-section">
-          <label className="sfp-label">Query JSON (op / match / filters)</label>
+          <label className="sfp-label">Request JSON (sent to /aiquery exactly as written)</label>
           <textarea
             className="sfp-query-input sfp-json-input"
-            placeholder={'{\n  "op": "semantic_filter",\n  "match": "all",\n  "filters": [\n    { "field": "category", "op": "eq", "value": "Doors" }\n  ]\n}'}
+            placeholder={'{\n  "action": "get_parameters",\n  "elementId": "751237",\n  "parameters": ["Area"]\n}'}
             value={jsonText}
             onChange={(e) => setJsonText(e.target.value)}
             rows={10}
@@ -197,6 +212,21 @@ export default function SemanticFilterPanel({ selectedModel }: { selectedModel: 
               );
             })}
           </div>
+        </div>
+      )}
+
+      {/* Fallback for any response shape the card/results view above doesn't
+          know how to render. get_parameter always returns a "values" array
+          (one entry per requested parameter, in order) -- shown alone,
+          stripped of envelope fields (action/elementId/plugin/status), as
+          real JSON via JSON.stringify. Anything else without a "values"
+          field falls back to the full raw response. */}
+      {response && !backendError && !results && (
+        <div className="sfp-section">
+          <label className="sfp-label">{response.values !== undefined ? "Values" : "Raw Response"}</label>
+          <pre className="sfp-json">
+            {JSON.stringify(response.values !== undefined ? response.values : response, null, 2)}
+          </pre>
         </div>
       )}
     </div>

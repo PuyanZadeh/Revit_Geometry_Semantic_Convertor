@@ -1,8 +1,11 @@
+/* TEMP-DEBUG(qc-compact-viewer): the whole panel and its row/column wrappers
+   below are sized to fit their content (not a large fixed height/width) so
+   the 300x300 canvas/inspector boxes sit directly next to each other with
+   no leftover reserved space. Revert to the original fixed-size rules once
+   no longer needed for QC. */
 .vp-page {
   display: flex;
   flex-direction: column;
-  height: 80vh;
-  min-height: 520px;
   box-sizing: border-box;
   gap: 12px;
   padding: 20px 24px;
@@ -25,34 +28,33 @@
 }
 
 .vp-body {
-  flex: 1;
-  min-height: 0;
+  flex: none;
   display: flex;
   gap: 8px;
 }
 
 .vp-viewer-col {
-  flex: 1;
+  flex: none;
   min-width: 0;
-  max-width: 1100px;
   display: flex;
 }
 
 .vp-canvas {
-  flex: 1;
-  min-width: 0;
+  flex: none;
+  width: 300px;
+  height: 300px;
   border: 1px solid #333;
   border-radius: 4px;
-  overflow: hidden;
+  overflow: auto;
   background: #1e1e1e;
   cursor: pointer;
 }
 
 .vp-inspector-col {
-  width: 380px;
   flex: none;
-  height: 100%;
+  width: 300px;
+  height: 300px;
   border: 1px solid #333;
   border-radius: 4px;
-  overflow: hidden;
+  overflow: auto;
 }
